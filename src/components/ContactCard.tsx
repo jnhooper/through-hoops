@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Video, Copy, Check, Clock, Trash2, Calendar } from 'lucide-react';
 import type { Contact } from '../types/contact';
+import { resolveAvatarUrl } from '../services/db';
 
 interface ContactCardProps {
   contact: Contact;
@@ -103,7 +104,7 @@ export const ContactCard: React.FC<ContactCardProps> = ({
         <div className="relative shrink-0">
           {contact.photo_path ? (
             <img
-              src={contact.photo_path}
+              src={resolveAvatarUrl(contact.photo_path) || undefined}
               alt={contact.name}
               className="h-12 w-12 rounded-xl object-cover ring-2 ring-zinc-700"
             />

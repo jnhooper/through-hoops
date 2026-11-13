@@ -8,17 +8,23 @@ import {
   Sparkles,
   Radio,
   QrCode,
+  Settings,
+  UserRound,
 } from 'lucide-react';
 import type { Contact } from '../types/contact';
+import type { LocalProfile } from '../types/profile';
 import {
   loadContactsFromDb,
   insertContact,
   updateContactLastCalled,
   removeContact,
+  getLocalProfile,
+  resolveAvatarUrl,
 } from '../services/db';
 import { ContactCard } from '../components/ContactCard';
 import { AddContactModal } from '../components/AddContactModal';
 import { MyCodeModal } from '../components/MyCodeModal';
+import { ProfileModal } from '../components/ProfileModal';
 
 interface HomeProps {
   onStartCall: (contact: Contact) => void;
@@ -30,6 +36,11 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
   const [isMyCodeOpen, setIsMyCodeOpen] = useState<boolean>(false);
+  const [isProfileOpen, setIsProfileOpen] = useState<boolean>(false);
+  const [localProfile, setLocalProfile] = useState<LocalProfile>({
+    name: '',
+    photo_path: null,
+  });
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   // Load contacts from SQLite via @tauri-apps/plugin-sql
@@ -67,6 +78,20 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
     }
 
     init();
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    getLocalProfile()
+      .then((profile) => {
+        if (!ignore) setLocalProfile(profile);
+      })
+      .catch((err: unknown) => {
+        console.error('Failed to load local profile:', err);
+      });
     return () => {
       ignore = true;
     };
@@ -159,6 +184,29 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
           </div>
 
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setIsProfileOpen(true)}
+              title="Edit your profile"
+              className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/70 px-2.5 py-2 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-700 hover:bg-zinc-900 hover:text-white"
+            >
+              {resolveAvatarUrl(localProfile.photo_path) ? (
+                <img
+                  src={resolveAvatarUrl(localProfile.photo_path)!}
+                  alt="Your avatar"
+                  className="h-6 w-6 rounded-lg object-cover"
+                />
+              ) : (
+                <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-zinc-800 text-zinc-400">
+                  <UserRound className="h-3.5 w-3.5" />
+                </div>
+              )}
+              <span className="hidden max-w-24 truncate sm:inline">
+                {localProfile.name || 'Your Profile'}
+              </span>
+              <Settings className="h-3.5 w-3.5 text-zinc-500" />
+            </button>
+
             <button
               type="button"
               onClick={() => setIsMyCodeOpen(true)}
@@ -345,6 +393,14 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
         isOpen={isMyCodeOpen}
         onClose={() => setIsMyCodeOpen(false)}
       />
+
+      {isProfileOpen && (
+        <ProfileModal
+          isOpen
+          onClose={() => setIsProfileOpen(false)}
+          onSaved={setLocalProfile}
+        />
+      )}
     </div>
   );
 };

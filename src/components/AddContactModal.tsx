@@ -1,11 +1,16 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, UserPlus, Fingerprint, User, AlertCircle, Loader2 } from 'lucide-react';
+import { performHandshake } from '../services/db';
 
 interface AddContactModalProps {
   isOpen: boolean;
   onClose: () => void;
   onContactAdded: () => Promise<void> | void;
-  onSaveContact: (irohNodeId: string, name: string) => Promise<void>;
+  onSaveContact: (
+    irohNodeId: string,
+    name: string,
+    photoPath?: string | null
+  ) => Promise<void>;
 }
 
 export const AddContactModal: React.FC<AddContactModalProps> = ({
@@ -56,7 +61,12 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
     try {
       setIsSubmitting(true);
       setError(null);
-      await onSaveContact(cleanId, cleanName);
+      const handshake = await performHandshake(cleanId);
+      await onSaveContact(
+        handshake.remote_node_id,
+        handshake.remote_name?.trim() || cleanName,
+        handshake.remote_photo_path
+      );
       await onContactAdded();
       handleClose();
     } catch (err: unknown) {
@@ -150,8 +160,8 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
                 className="w-full rounded-xl bg-zinc-950/70 border border-zinc-800 pl-10 pr-4 py-2.5 text-sm font-mono text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500 transition-all"
               />
             </div>
-            <p className="mt-1.5 text-[11px] text-zinc-500">
-              The public key identifier of the remote peer's Iroh node.
+            <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
+              Saving exchanges your latest saved profile with this peer over the Iroh handshake.
             </p>
           </div>
 
@@ -172,7 +182,7 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
               {isSubmitting ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  Saving...
+                  Connecting...
                 </>
               ) : (
                 <>

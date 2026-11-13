@@ -1,7 +1,11 @@
 import Database from '@tauri-apps/plugin-sql';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import type { Contact } from '../types/contact';
+import type { LocalProfile, HandshakeResult } from '../types/profile';
 
 const DB_NAME = 'sqlite:contacts.db';
+const PROFILE_STORAGE_KEY = 'p2p_local_profile';
+const MOCK_STORAGE_KEY = 'p2p_mock_contacts';
 
 let dbInstance: Database | null = null;
 
@@ -10,8 +14,6 @@ export const isTauriEnvironment = (): boolean => {
 };
 
 // Fallback in-memory contacts when previewing in standard browser without Tauri
-const MOCK_STORAGE_KEY = 'p2p_mock_contacts';
-
 const getMockContacts = (): Contact[] => {
   try {
     const raw = localStorage.getItem(MOCK_STORAGE_KEY);
@@ -41,20 +43,6 @@ const getMockContacts = (): Contact[] => {
       photo_path: null,
       added_at: new Date(Date.now() - 86400000 * 2).toISOString(),
       last_called_at: new Date(Date.now() - 1000 * 60 * 60 * 26).toISOString(),
-    },
-    {
-      iroh_node_id: '1a76201cf902b489c72199b19402a71bc98371a',
-      name: 'David Kim',
-      photo_path: null,
-      added_at: new Date(Date.now() - 86400000 * 1).toISOString(),
-      last_called_at: null,
-    },
-    {
-      iroh_node_id: '9f81a700142b93809cb8192a00c8723910cbe21',
-      name: 'Zara Thorne',
-      photo_path: null,
-      added_at: new Date(Date.now() - 86400000 * 4).toISOString(),
-      last_called_at: null,
     },
   ];
   try {
@@ -102,7 +90,11 @@ export async function loadContactsFromDb(): Promise<Contact[]> {
   return contacts;
 }
 
-export async function insertContact(irohNodeId: string, name: string): Promise<void> {
+export async function insertContact(
+  irohNodeId: string,
+  name: string,
+  photoPath?: string | null
+): Promise<void> {
   const trimmedId = irohNodeId.trim();
   const trimmedName = name.trim();
 
@@ -119,7 +111,7 @@ export async function insertContact(irohNodeId: string, name: string): Promise<v
     const newContact: Contact = {
       iroh_node_id: trimmedId,
       name: trimmedName,
-      photo_path: null,
+      photo_path: photoPath || null,
       added_at: new Date().toISOString(),
       last_called_at: null,
     };
@@ -128,8 +120,8 @@ export async function insertContact(irohNodeId: string, name: string): Promise<v
   }
 
   await db.execute(
-    'INSERT INTO contacts (iroh_node_id, name, added_at) VALUES ($1, $2, CURRENT_TIMESTAMP)',
-    [trimmedId, trimmedName]
+    'INSERT OR REPLACE INTO contacts (iroh_node_id, name, photo_path, added_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)',
+    [trimmedId, trimmedName, photoPath || null]
   );
 }
 
@@ -161,4 +153,103 @@ export async function removeContact(irohNodeId: string): Promise<void> {
   }
 
   await db.execute('DELETE FROM contacts WHERE iroh_node_id = $1', [irohNodeId]);
+}
+
+// ================= Local Profile API =================
+
+export async function getLocalProfile(): Promise<LocalProfile> {
+  if (isTauriEnvironment()) {
+    try {
+      return await invoke<LocalProfile>('get_local_profile');
+    } catch (e) {
+      console.warn('invoke get_local_profile failed, falling back to db query', e);
+    }
+
+    const db = await getDb();
+    if (db) {
+      const rows = await db.select<LocalProfile[]>(
+        'SELECT name, photo_path FROM local_profile WHERE id = 1'
+      );
+      if (rows && rows.length > 0) {
+        return rows[0];
+      }
+    }
+  }
+
+  try {
+    const saved = localStorage.getItem(PROFILE_STORAGE_KEY);
+    if (saved) return JSON.parse(saved);
+  } catch (e) {
+    console.error('Failed to read local profile from storage', e);
+  }
+
+  return { name: '', photo_path: null };
+}
+
+export async function saveLocalProfile(
+  name: string,
+  photoPath?: string | null
+): Promise<LocalProfile> {
+  const trimmedName = name.trim();
+  const cleanPhotoPath = photoPath || null;
+
+  if (isTauriEnvironment()) {
+    try {
+      return await invoke<LocalProfile>('save_local_profile', {
+        name: trimmedName,
+        photoPath: cleanPhotoPath,
+      });
+    } catch (e) {
+      console.warn('invoke save_local_profile failed, falling back to db execute', e);
+    }
+
+    const db = await getDb();
+    if (db) {
+      await db.execute(
+        'INSERT OR REPLACE INTO local_profile (id, name, photo_path) VALUES (1, $1, $2)',
+        [trimmedName, cleanPhotoPath]
+      );
+    }
+  }
+
+  const profile: LocalProfile = { name: trimmedName, photo_path: cleanPhotoPath };
+  try {
+    localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
+  } catch (e) {
+    console.error('Failed to save profile to storage', e);
+  }
+
+  return profile;
+}
+
+export async function performHandshake(remoteId: string): Promise<HandshakeResult> {
+  if (isTauriEnvironment()) {
+    try {
+      return await invoke<HandshakeResult>('perform_handshake', {
+        remoteId: remoteId.trim(),
+      });
+    } catch (e) {
+      console.warn('invoke perform_handshake failed:', e);
+      throw e;
+    }
+  }
+
+  return {
+    remote_node_id: remoteId,
+    remote_name: null,
+    remote_photo_path: null,
+  };
+}
+
+export function resolveAvatarUrl(photoPath?: string | null): string | null {
+  if (!photoPath) return null;
+  if (
+    photoPath.startsWith('http://') ||
+    photoPath.startsWith('https://') ||
+    photoPath.startsWith('data:') ||
+    photoPath.startsWith('blob:')
+  ) {
+    return photoPath;
+  }
+  return isTauriEnvironment() ? convertFileSrc(photoPath) : photoPath;
 }
