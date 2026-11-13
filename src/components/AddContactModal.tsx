@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { X, UserPlus, Fingerprint, User, AlertCircle, Loader2 } from 'lucide-react';
+import { X, UserPlus, Fingerprint, AlertCircle, Loader2 } from 'lucide-react';
 import { performHandshake } from '../services/db';
 
 interface AddContactModalProps {
@@ -19,14 +19,12 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
   onContactAdded,
   onSaveContact,
 }) => {
-  const [name, setName] = useState('');
   const [irohNodeId, setIrohNodeId] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleClose = useCallback(() => {
     if (isSubmitting) return;
-    setName('');
     setIrohNodeId('');
     setError(null);
     onClose();
@@ -46,13 +44,8 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanName = name.trim();
     const cleanId = irohNodeId.trim();
 
-    if (!cleanName) {
-      setError('Please provide a name for this contact.');
-      return;
-    }
     if (!cleanId) {
       setError('Please provide the Iroh Node ID.');
       return;
@@ -64,7 +57,7 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
       const handshake = await performHandshake(cleanId);
       await onSaveContact(
         handshake.remote_node_id,
-        handshake.remote_name?.trim() || cleanName,
+        handshake.remote_name?.trim() || 'Anonymous',
         handshake.remote_photo_path
       );
       await onContactAdded();
@@ -100,7 +93,7 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
             </div>
             <div>
               <h3 className="text-lg font-semibold text-zinc-100">Add New Contact</h3>
-              <p className="text-xs text-zinc-400">Save a peer to initiate direct P2P calls</p>
+              <p className="text-xs text-zinc-400">Exchange profiles directly with a peer</p>
             </div>
           </div>
           <button
@@ -125,26 +118,6 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
         <form onSubmit={handleSubmit} className="mt-5 space-y-4">
           <div>
             <label className="block text-xs font-medium uppercase tracking-wider text-zinc-400 mb-1.5">
-              Contact Name
-            </label>
-            <div className="relative">
-              <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-zinc-500">
-                <User className="h-4 w-4" />
-              </div>
-              <input
-                type="text"
-                autoFocus
-                required
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="e.g. Alice Cooper"
-                className="w-full rounded-xl bg-zinc-950/70 border border-zinc-800 pl-10 pr-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500 transition-all"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium uppercase tracking-wider text-zinc-400 mb-1.5">
               Iroh Node ID / Peer Key
             </label>
             <div className="relative">
@@ -153,7 +126,9 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
               </div>
               <input
                 type="text"
+                autoFocus
                 required
+                spellCheck={false}
                 value={irohNodeId}
                 onChange={(e) => setIrohNodeId(e.target.value)}
                 placeholder="e.g. 7ba390d4f1883c749a02d41b..."
@@ -161,7 +136,7 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
               />
             </div>
             <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-              Saving exchanges your latest saved profile with this peer over the Iroh handshake.
+              Paste a peer code. Both contacts lists will update after profiles and avatars are exchanged.
             </p>
           </div>
 
@@ -187,7 +162,7 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
               ) : (
                 <>
                   <UserPlus className="h-4 w-4" />
-                  Save Contact
+                  Add Contact
                 </>
               )}
             </button>

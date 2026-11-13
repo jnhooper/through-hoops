@@ -56,6 +56,29 @@ pub async fn upsert_local_profile(
     })
 }
 
+pub async fn upsert_contact(
+    app: &AppHandle,
+    node_id: &str,
+    name: &str,
+    photo_path: Option<&str>,
+) -> anyhow::Result<()> {
+    let pool = get_sqlite_pool(app).await?;
+    sqlx::query(
+        "INSERT INTO contacts (iroh_node_id, name, photo_path, added_at)
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT(iroh_node_id) DO UPDATE SET
+             name = excluded.name,
+             photo_path = excluded.photo_path",
+    )
+    .bind(node_id)
+    .bind(name)
+    .bind(photo_path)
+    .execute(&pool)
+    .await?;
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_local_profile(app: AppHandle) -> Result<LocalProfile, String> {
     query_local_profile(&app)

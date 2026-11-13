@@ -1,6 +1,7 @@
 use tauri::Manager;
 use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
 
+pub mod avatar;
 pub mod db;
 pub mod signaling;
 

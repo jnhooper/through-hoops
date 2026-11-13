@@ -105,9 +105,6 @@ export async function insertContact(
   const db = await getDb();
   if (!db) {
     const list = getMockContacts();
-    if (list.some((c) => c.iroh_node_id.toLowerCase() === trimmedId.toLowerCase())) {
-      throw new Error(`Contact with Iroh Node ID "${trimmedId}" already exists.`);
-    }
     const newContact: Contact = {
       iroh_node_id: trimmedId,
       name: trimmedName,
@@ -115,12 +112,27 @@ export async function insertContact(
       added_at: new Date().toISOString(),
       last_called_at: null,
     };
-    saveMockContacts([newContact, ...list]);
+    const exists = list.some(
+      (contact) => contact.iroh_node_id.toLowerCase() === trimmedId.toLowerCase()
+    );
+    saveMockContacts(
+      exists
+        ? list.map((contact) =>
+            contact.iroh_node_id.toLowerCase() === trimmedId.toLowerCase()
+              ? { ...contact, name: trimmedName, photo_path: photoPath || null }
+              : contact
+          )
+        : [newContact, ...list]
+    );
     return;
   }
 
   await db.execute(
-    'INSERT OR REPLACE INTO contacts (iroh_node_id, name, photo_path, added_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)',
+    `INSERT INTO contacts (iroh_node_id, name, photo_path, added_at)
+     VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+     ON CONFLICT(iroh_node_id) DO UPDATE SET
+       name = excluded.name,
+       photo_path = excluded.photo_path`,
     [trimmedId, trimmedName, photoPath || null]
   );
 }

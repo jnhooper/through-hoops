@@ -1,4 +1,7 @@
-use crate::db;
+use crate::{
+    avatar::{AvatarPayload, load_local_avatar, save_received_avatar},
+    db,
+};
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -7,6 +10,7 @@ use std::str::FromStr;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const SIGNALING_ALPN: &[u8] = b"/p2p-video-chat/signaling/0";
+const MAX_HANDSHAKE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HandshakePayload {
@@ -14,7 +18,8 @@ pub struct HandshakePayload {
     pub msg_type: String, // "handshake"
     pub node_id: String,
     pub name: String,
-    pub photo_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<AvatarPayload>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -27,6 +32,46 @@ pub struct HandshakeResult {
 #[derive(Clone, Debug)]
 pub struct SignalingProtocolHandler {
     app_handle: AppHandle,
+    local_node_id: String,
+}
+
+fn normalized_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        "Anonymous".to_string()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
+}
+
+async fn local_handshake(app: &AppHandle, node_id: String) -> Result<HandshakePayload, String> {
+    let profile = db::query_local_profile(app)
+        .await
+        .map_err(|err| format!("Failed to read local profile: {err}"))?;
+    let photo = load_local_avatar(profile.photo_path.as_deref()).await;
+
+    Ok(HandshakePayload {
+        msg_type: "handshake".to_string(),
+        node_id,
+        name: normalized_name(&profile.name),
+        photo,
+    })
+}
+
+async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &HandshakePayload) {
+    // The connection authenticates the peer ID; never trust the self-declared payload ID.
+    let photo_path = save_received_avatar(app, handshake.photo.as_ref()).await;
+    let name = normalized_name(&handshake.name);
+
+    match db::upsert_contact(app, remote_id, &name, photo_path.as_deref()).await {
+        Ok(()) => {
+            log::info!("Added or updated contact for peer {remote_id}");
+            if let Err(err) = app.emit("contacts_changed", ()) {
+                log::error!("Failed to emit contacts_changed event: {err}");
+            }
+        }
+        Err(err) => log::error!("Failed to save contact for peer {remote_id}: {err}"),
+    }
 }
 
 impl ProtocolHandler for SignalingProtocolHandler {
@@ -35,6 +80,7 @@ impl ProtocolHandler for SignalingProtocolHandler {
         connection: iroh::endpoint::Connection,
     ) -> std::result::Result<(), AcceptError> {
         let app = self.app_handle.clone();
+        let local_node_id = self.local_node_id.clone();
         tokio::spawn(async move {
             let remote_id = connection.remote_id().to_string();
             log::info!("Accepted Iroh connection from {remote_id}");
@@ -46,37 +92,41 @@ impl ProtocolHandler for SignalingProtocolHandler {
                             Ok((mut send, mut recv)) => {
                                 let app_inner = app.clone();
                                 let peer = remote_id.clone();
+                                let local_id = local_node_id.clone();
                                 tokio::spawn(async move {
-                                    if let Ok(bytes) = recv.read_to_end(10 * 1024 * 1024).await {
-                                        let payload = String::from_utf8_lossy(&bytes).to_string();
-                                        log::info!("Received bi stream signal ({} bytes) from {peer}", payload.len());
+                                    let bytes = match recv.read_to_end(MAX_HANDSHAKE_BYTES).await {
+                                        Ok(bytes) => bytes,
+                                        Err(err) => {
+                                            log::warn!("Error reading incoming bi stream: {err}");
+                                            return;
+                                        }
+                                    };
+                                    log::info!("Received bi stream signal ({} bytes) from {peer}", bytes.len());
 
-                                        if let Ok(handshake) = serde_json::from_slice::<HandshakePayload>(&bytes)
-                                            && handshake.msg_type == "handshake"
-                                        {
-                                            log::info!("Received handshake from peer {}: {}", peer, handshake.name);
-                                            if let Ok(my_profile) = db::query_local_profile(&app_inner).await {
-                                                let my_name = if my_profile.name.trim().is_empty() {
-                                                    "Anonymous".to_string()
-                                                } else {
-                                                    my_profile.name.trim().to_string()
-                                                };
-                                                let reply = HandshakePayload {
-                                                    msg_type: "handshake".to_string(),
-                                                    node_id: peer.clone(),
-                                                    name: my_name,
-                                                    photo_path: my_profile.photo_path,
-                                                };
-                                                if let Ok(reply_bytes) = serde_json::to_vec(&reply) {
-                                                    let _ = send.write_all(&reply_bytes).await;
-                                                    let _ = send.finish();
+                                    if let Ok(handshake) = serde_json::from_slice::<HandshakePayload>(&bytes)
+                                        && handshake.msg_type == "handshake"
+                                    {
+                                        log::info!("Received handshake from peer {}: {}", peer, handshake.name);
+                                        save_incoming_contact(&app_inner, &peer, &handshake).await;
+
+                                        match local_handshake(&app_inner, local_id).await {
+                                            Ok(reply) => match serde_json::to_vec(&reply) {
+                                                Ok(reply_bytes) => {
+                                                    if let Err(err) = send.write_all(&reply_bytes).await {
+                                                        log::warn!("Failed to send handshake reply to {peer}: {err}");
+                                                    }
                                                 }
-                                            }
+                                                Err(err) => log::error!("Failed to serialize handshake reply: {err}"),
+                                            },
+                                            Err(err) => log::error!("Failed to build handshake reply: {err}"),
                                         }
+                                        let _ = send.finish();
+                                        return;
+                                    }
 
-                                        if let Err(err) = app_inner.emit("incoming_signal", &payload) {
-                                            log::error!("Failed to emit incoming_signal event: {err}");
-                                        }
+                                    let payload = String::from_utf8_lossy(&bytes).to_string();
+                                    if let Err(err) = app_inner.emit("incoming_signal", &payload) {
+                                        log::error!("Failed to emit incoming_signal event: {err}");
                                     }
                                 });
                             }
@@ -183,8 +233,15 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
 
     log::info!("Iroh node bound with persistent Node ID: {}", endpoint.id());
 
+    let local_node_id = endpoint.id().to_string();
     let router = Router::builder(endpoint.clone())
-        .accept(SIGNALING_ALPN, SignalingProtocolHandler { app_handle })
+        .accept(
+            SIGNALING_ALPN,
+            SignalingProtocolHandler {
+                app_handle,
+                local_node_id,
+            },
+        )
         .spawn();
 
     Ok(SignalingState {
@@ -236,83 +293,48 @@ pub async fn perform_handshake(
     app: AppHandle,
     state: State<'_, SignalingState>,
 ) -> std::result::Result<HandshakeResult, String> {
-    let profile = db::query_local_profile(&app)
-        .await
-        .map_err(|e| format!("Failed to read local profile: {e}"))?;
-
-    let my_name = if profile.name.trim().is_empty() {
-        "Anonymous".to_string()
-    } else {
-        profile.name.trim().to_string()
-    };
-
-    let my_node_id = state.endpoint.id().to_string();
-
-    let handshake_payload = HandshakePayload {
-        msg_type: "handshake".to_string(),
-        node_id: my_node_id,
-        name: my_name,
-        photo_path: profile.photo_path,
-    };
-
-    let payload_bytes = serde_json::to_vec(&handshake_payload)
-        .map_err(|e| format!("Failed to serialize handshake payload: {e}"))?;
-
     let endpoint_id = EndpointId::from_str(&remote_id)
-        .map_err(|e| format!("Invalid remote Iroh node ID: {e}"))?;
+        .map_err(|err| format!("Invalid remote Iroh node ID: {err}"))?;
+    if endpoint_id == state.endpoint.id() {
+        return Err("You cannot add your own node as a contact".to_string());
+    }
+
+    let handshake_payload = local_handshake(&app, state.endpoint.id().to_string()).await?;
+    let payload_bytes = serde_json::to_vec(&handshake_payload)
+        .map_err(|err| format!("Failed to serialize handshake payload: {err}"))?;
 
     let conn = state
         .endpoint
         .connect(endpoint_id, SIGNALING_ALPN)
         .await
-        .map_err(|e| format!("Failed to connect to remote node {remote_id}: {e}"))?;
+        .map_err(|err| format!("Failed to connect to remote node {remote_id}: {err}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|err| format!("Failed to open handshake stream: {err}"))?;
 
-    match conn.open_bi().await {
-        Ok((mut send, mut recv)) => {
-            send.write_all(&payload_bytes)
-                .await
-                .map_err(|e| format!("Failed to send handshake: {e}"))?;
-            send.finish()
-                .map_err(|e| format!("Failed to finish handshake stream: {e}"))?;
+    send.write_all(&payload_bytes)
+        .await
+        .map_err(|err| format!("Failed to send handshake: {err}"))?;
+    send.finish()
+        .map_err(|err| format!("Failed to finish handshake stream: {err}"))?;
 
-            let resp_bytes = recv.read_to_end(10 * 1024 * 1024).await;
-            let (remote_name, remote_photo_path) = match resp_bytes {
-                Ok(bytes) if !bytes.is_empty() => {
-                    if let Ok(resp_payload) = serde_json::from_slice::<HandshakePayload>(&bytes) {
-                        (Some(resp_payload.name), resp_payload.photo_path)
-                    } else {
-                        (None, None)
-                    }
-                }
-                _ => (None, None),
-            };
-
-            Ok(HandshakeResult {
-                remote_node_id: remote_id,
-                remote_name,
-                remote_photo_path,
-            })
-        }
-        Err(_) => {
-            let mut send = conn
-                .open_uni()
-                .await
-                .map_err(|e| format!("Failed to open uni stream to remote node: {e}"))?;
-
-            send.write_all(&payload_bytes)
-                .await
-                .map_err(|e| format!("Failed to write handshake payload: {e}"))?;
-
-            send.finish()
-                .map_err(|e| format!("Failed to finish handshake stream: {e}"))?;
-
-            Ok(HandshakeResult {
-                remote_node_id: remote_id,
-                remote_name: None,
-                remote_photo_path: None,
-            })
-        }
+    let response_bytes = recv
+        .read_to_end(MAX_HANDSHAKE_BYTES)
+        .await
+        .map_err(|err| format!("Failed to read handshake response: {err}"))?;
+    let response = serde_json::from_slice::<HandshakePayload>(&response_bytes)
+        .map_err(|err| format!("Invalid handshake response: {err}"))?;
+    if response.msg_type != "handshake" {
+        return Err("Peer returned an invalid handshake response".to_string());
     }
+
+    let remote_photo_path = save_received_avatar(&app, response.photo.as_ref()).await;
+    Ok(HandshakeResult {
+        remote_node_id: remote_id,
+        remote_name: Some(normalized_name(&response.name)),
+        remote_photo_path,
+    })
 }
 
 #[cfg(test)]

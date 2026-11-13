@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import {
   Clock,
   Users,
@@ -20,6 +21,7 @@ import {
   removeContact,
   getLocalProfile,
   resolveAvatarUrl,
+  isTauriEnvironment,
 } from '../services/db';
 import { ContactCard } from '../components/ContactCard';
 import { AddContactModal } from '../components/AddContactModal';
@@ -82,6 +84,28 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
       ignore = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    listen<void>('contacts_changed', () => {
+      void fetchContacts();
+    })
+      .then((stopListening) => {
+        if (disposed) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch((err: unknown) => {
+        console.error('Failed to listen for contact updates:', err);
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [fetchContacts]);
 
   useEffect(() => {
     let ignore = false;
