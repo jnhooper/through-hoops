@@ -74,6 +74,23 @@ async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &Han
     }
 }
 
+async fn forward_uni_signal<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    peer: String,
+    mut recv: iroh::endpoint::RecvStream,
+) {
+    match recv.read_to_end(10 * 1024 * 1024).await {
+        Ok(bytes) => {
+            let payload = String::from_utf8_lossy(&bytes).to_string();
+            log::info!("Received signal ({} bytes) from {peer}", payload.len());
+            if let Err(err) = app.emit("incoming_signal", &payload) {
+                log::error!("Failed to emit incoming_signal event: {err}");
+            }
+        }
+        Err(err) => log::warn!("Error reading incoming signaling stream: {err}"),
+    }
+}
+
 impl ProtocolHandler for SignalingProtocolHandler {
     async fn accept(
         &self,
@@ -138,23 +155,10 @@ impl ProtocolHandler for SignalingProtocolHandler {
                     }
                     uni_res = connection.accept_uni() => {
                         match uni_res {
-                            Ok(mut recv) => {
+                            Ok(recv) => {
                                 let app_inner = app.clone();
                                 let peer = remote_id.clone();
-                                tokio::spawn(async move {
-                                    match recv.read_to_end(10 * 1024 * 1024).await {
-                                        Ok(bytes) => {
-                                            let payload = String::from_utf8_lossy(&bytes).to_string();
-                                            log::info!("Received signal ({} bytes) from {peer}", payload.len());
-                                            if let Err(err) = app_inner.emit("incoming_signal", &payload) {
-                                                log::error!("Failed to emit incoming_signal event: {err}");
-                                            }
-                                        }
-                                        Err(err) => {
-                                            log::warn!("Error reading incoming signaling stream: {err}");
-                                        }
-                                    }
-                                });
+                                tokio::spawn(forward_uni_signal(app_inner, peer, recv));
                             }
                             Err(err) => {
                                 log::debug!("Uni stream accept ended for {remote_id}: {err}");
@@ -284,6 +288,16 @@ pub async fn send_signal(
     send.finish()
         .map_err(|e| format!("Failed to finish stream: {e}"))?;
 
+    // `finish` only marks the stream as complete. Keep the connection alive until
+    // the peer acknowledges the data so dropping `conn` cannot discard the signal.
+    let stopped = send
+        .stopped()
+        .await
+        .map_err(|e| format!("Failed while waiting for signal delivery: {e}"))?;
+    if let Some(code) = stopped {
+        return Err(format!("Remote stopped the signal stream with code {code}"));
+    }
+
     Ok(())
 }
 
@@ -340,6 +354,28 @@ pub async fn perform_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tauri::Listener;
+
+    #[derive(Clone, Debug)]
+    struct MockSignalHandler {
+        app: AppHandle<tauri::test::MockRuntime>,
+    }
+
+    impl ProtocolHandler for MockSignalHandler {
+        async fn accept(
+            &self,
+            connection: iroh::endpoint::Connection,
+        ) -> std::result::Result<(), AcceptError> {
+            let app = self.app.clone();
+            tokio::spawn(async move {
+                if let Ok(recv) = connection.accept_uni().await {
+                    forward_uni_signal(app, "test-peer".to_string(), recv).await;
+                }
+            });
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_secret_key_roundtrip() {
@@ -349,5 +385,49 @@ mod tests {
 
         let restored = SecretKey::from(bytes);
         assert_eq!(key.public(), restored.public());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uni_signal_emits_incoming_call_event() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let app = tauri::test::mock_app();
+            let receiver = Endpoint::builder(presets::N0).bind().await.unwrap();
+            let _router = Router::builder(receiver.clone())
+                .accept(
+                    SIGNALING_ALPN,
+                    MockSignalHandler {
+                        app: app.handle().clone(),
+                    },
+                )
+                .spawn();
+
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.handle().once("incoming_signal", move |event| {
+                let payload = serde_json::from_str::<String>(event.payload()).unwrap();
+                let _ = event_tx.send(payload);
+            });
+
+            let sender = Endpoint::builder(presets::N0).bind().await.unwrap();
+            let payload = serde_json::json!({
+                "type": "offer",
+                "sdp": "test-offer",
+                "sender": sender.id().to_string(),
+            })
+            .to_string();
+            let connection = sender
+                .connect(receiver.addr(), SIGNALING_ALPN)
+                .await
+                .unwrap();
+            let mut stream = connection.open_uni().await.unwrap();
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            stream.finish().unwrap();
+
+            let received = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("receiver did not emit incoming_signal");
+            assert_eq!(received.as_deref(), Some(payload.as_str()));
+        })
+        .await
+        .expect("two-node signaling test timed out");
     }
 }
