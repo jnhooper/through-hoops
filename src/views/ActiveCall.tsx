@@ -14,7 +14,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import type { Contact } from '../types/contact';
-import type { SignalMessage } from '../types/signaling';
+import type { HangupReason, SignalMessage } from '../types/signaling';
 import { getMyNodeId, sendSignal, listenForIncomingSignals } from '../services/signaling';
 
 interface ActiveCallProps {
@@ -62,6 +62,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   const remoteNodeIdRef = useRef<string>(contact?.iroh_node_id || initialSignal?.sender || '');
   const iceCandidatesQueueRef = useRef<RTCIceCandidateInit[]>([]);
   const isCallEndedRef = useRef<boolean>(false);
+  const hasSentHangupRef = useRef<boolean>(false);
+  const hasConnectedRef = useRef<boolean>(false);
+  const disconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Timer
   useEffect(() => {
@@ -77,11 +80,18 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Safe cleanup of media tracks and peer connection
+  const clearDisconnectTimeout = useCallback(() => {
+    if (disconnectTimeoutRef.current) {
+      clearTimeout(disconnectTimeoutRef.current);
+      disconnectTimeoutRef.current = null;
+    }
+  }, []);
+
+  // Resource-only teardown is also used by React's effect cleanup. It never signals.
   const cleanup = useCallback(() => {
     isCallEndedRef.current = true;
+    clearDisconnectTimeout();
 
-    // Stop local camera/mic tracks
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => {
         try {
@@ -93,7 +103,6 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
       localStreamRef.current = null;
     }
 
-    // Stop screen share tracks
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((track) => {
         try {
@@ -105,40 +114,121 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
       screenStreamRef.current = null;
     }
 
-    // Close and nullify RTCPeerConnection
     if (pcRef.current) {
+      const pc = pcRef.current;
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.onconnectionstatechange = null;
       try {
-        pcRef.current.close();
+        pc.close();
       } catch (e) {
         console.warn('Error closing peer connection:', e);
       }
       pcRef.current = null;
     }
 
-    // Reset video refs
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = null;
-    }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = null;
+    iceCandidatesQueueRef.current = [];
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+  }, [clearDisconnectTimeout]);
+
+  // All user-facing and remote-triggered exits converge here. The guard makes
+  // teardown idempotent and ensures an inbound hangup is never echoed back.
+  const cleanupCall = useCallback(() => {
+    if (isCallEndedRef.current) return;
+    cleanup();
+    onEndCall();
+  }, [cleanup, onEndCall]);
+
+  const sendHangup = useCallback(async (reason: HangupReason) => {
+    if (hasSentHangupRef.current) return;
+    const remoteId = remoteNodeIdRef.current;
+    if (!remoteId) return;
+    hasSentHangupRef.current = true;
+
+    try {
+      const sender = myNodeIdRef.current || (await getMyNodeId());
+      myNodeIdRef.current = sender;
+      await sendSignal(remoteId, JSON.stringify({ type: 'hangup', reason, sender }));
+    } catch (err) {
+      console.debug('[WebRTC] Hangup signal could not be delivered:', err);
     }
   }, []);
 
   const handleHangUp = useCallback(() => {
-    cleanup();
-    onEndCall();
-  }, [cleanup, onEndCall]);
+    void sendHangup(hasConnectedRef.current ? 'ended' : 'cancelled');
+    cleanupCall();
+  }, [sendHangup, cleanupCall]);
+
+  // Listen for hangups independently of WebRTC initialization so a cancellation
+  // cannot be missed while media devices or SDP are still being initialized.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    listenForIncomingSignals((payloadString) => {
+      try {
+        const signal = JSON.parse(payloadString) as SignalMessage;
+        const currentPeer = remoteNodeIdRef.current;
+        if (
+          signal.type === 'hangup' &&
+          signal.sender &&
+          currentPeer &&
+          signal.sender.toLowerCase() === currentPeer.toLowerCase()
+        ) {
+          cleanupCall();
+        }
+      } catch {
+        // The main signaling listener reports malformed WebRTC payloads.
+      }
+    })
+      .then((stopListening) => {
+        if (disposed) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch((err: unknown) => {
+        console.warn('[WebRTC] Failed to listen for hangup signals:', err);
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [cleanupCall]);
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      void sendHangup(hasConnectedRef.current ? 'ended' : 'cancelled');
+      cleanupCall();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [sendHangup, cleanupCall]);
 
   // Main WebRTC Initialization & Lifecycle
   useEffect(() => {
     let unlistenSignals: (() => void) | undefined;
     isCallEndedRef.current = false;
+    hasSentHangupRef.current = false;
+    hasConnectedRef.current = false;
 
     async function initWebRTC() {
       try {
         // 1. Fetch our local Iroh Node ID for signaling headers
         const myId = await getMyNodeId();
         myNodeIdRef.current = myId;
+        if (isCallEndedRef.current) return;
+
+        // Ring before touching camera hardware so the peer can show its incoming
+        // call UI immediately. The SDP offer follows once local media is ready.
+        if (!isIncoming && remoteNodeIdRef.current) {
+          void sendSignal(
+            remoteNodeIdRef.current,
+            JSON.stringify({ type: 'ring', sender: myId })
+          ).catch((err) => {
+            console.warn('[WebRTC] Early ring signal failed:', err);
+          });
+        }
 
         // 2. Capture Local Media (Camera & Mic)
         let localStream: MediaStream;
@@ -213,15 +303,27 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
           }
         };
 
-        // Track connection state
+        // Track connection state and recover briefly from transient disconnects.
         pc.onconnectionstatechange = () => {
-          console.info('[WebRTC] Connection state changed:', pc.connectionState);
-          if (pc.connectionState === 'connected') {
+          if (pcRef.current !== pc || isCallEndedRef.current) return;
+          const state = pc.connectionState;
+          console.info('[WebRTC] Connection state changed:', state);
+
+          if (state === 'connected') {
+            hasConnectedRef.current = true;
+            clearDisconnectTimeout();
             setConnectionStatus('connected');
-          } else if (pc.connectionState === 'disconnected') {
+          } else if (state === 'disconnected') {
             setConnectionStatus('disconnected');
-          } else if (pc.connectionState === 'failed') {
+            clearDisconnectTimeout();
+            disconnectTimeoutRef.current = setTimeout(() => {
+              if (pcRef.current === pc && pc.connectionState === 'disconnected') {
+                cleanupCall();
+              }
+            }, 4000);
+          } else if (state === 'failed' || state === 'closed') {
             setConnectionStatus('failed');
+            cleanupCall();
           }
         };
 
@@ -262,7 +364,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
               await currentPc.setLocalDescription(answer);
 
               const targetNode = remoteNodeIdRef.current || signal.sender;
-              if (targetNode) {
+              if (targetNode && !isCallEndedRef.current) {
                 const answerPayload = JSON.stringify({
                   type: 'answer',
                   sdp: answer.sdp,
@@ -292,7 +394,8 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         unlistenSignals = await listenForIncomingSignals((payloadString: string) => {
           try {
             const parsed = JSON.parse(payloadString) as SignalMessage;
-            if (parsed && parsed.type) {
+            if (parsed.type === 'hangup') return;
+            if (parsed.type) {
               handleSignalMessage(parsed);
             }
           } catch (e) {
@@ -304,22 +407,26 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         if (isIncoming && initialSignal) {
           await handleSignalMessage(initialSignal);
         } else if (!isIncoming && remoteNodeIdRef.current) {
+          if (isCallEndedRef.current) return;
           // 9. Caller mode: Generate SDP Offer and send to remote contact
           console.info('[WebRTC] Caller generating SDP Offer for:', remoteNodeIdRef.current);
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
 
+          // Trickle ICE: send the SDP now, while candidates continue to arrive
+          // through onicecandidate. Never wait for ICE gathering to complete.
           const offerPayload = JSON.stringify({
             type: 'offer',
             sdp: offer.sdp,
             sender: myNodeIdRef.current,
           });
 
+          if (isCallEndedRef.current) return;
           await sendSignal(remoteNodeIdRef.current, offerPayload);
         }
       } catch (err) {
         console.error('[WebRTC] Initialization error:', err);
-        setConnectionStatus('failed');
+        if (!isCallEndedRef.current) setConnectionStatus('failed');
       }
     }
 
@@ -331,7 +438,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         unlistenSignals();
       }
     };
-  }, [isIncoming, initialSignal, cleanup]);
+  }, [isIncoming, initialSignal, cleanup, cleanupCall, clearDisconnectTimeout]);
 
   // Toggle Microphone
   const toggleMute = () => {

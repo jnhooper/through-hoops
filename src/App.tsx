@@ -3,7 +3,7 @@ import type { Contact } from './types/contact';
 import type { SignalMessage } from './types/signaling';
 import { Home } from './views/Home';
 import { ActiveCall } from './views/ActiveCall';
-import { listenForIncomingSignals } from './services/signaling';
+import { getMyNodeId, listenForIncomingSignals, sendSignal } from './services/signaling';
 import { loadContactsFromDb } from './services/db';
 import { Video, PhoneOff, PhoneCall } from 'lucide-react';
 
@@ -12,7 +12,7 @@ export type AppView = 'home' | 'active-call';
 interface IncomingCallInfo {
   nodeId: string;
   name: string;
-  offerSignal: SignalMessage;
+  offerSignal: SignalMessage | null;
 }
 
 export default function App() {
@@ -29,29 +29,43 @@ export default function App() {
     listenForIncomingSignals(async (payloadString: string) => {
       try {
         const signal = JSON.parse(payloadString) as SignalMessage;
-        if (signal && signal.type === 'offer' && signal.sender) {
+        if (signal.type === 'hangup') {
+          if (signal.sender) {
+            const sender = signal.sender.toLowerCase();
+            setIncomingCall((pending) =>
+              pending && pending.nodeId.toLowerCase() === sender ? null : pending
+            );
+          }
+          return;
+        }
+
+        const sender = signal.sender;
+        if ((signal.type === 'ring' || signal.type === 'offer') && sender) {
           // If already in an active call, ActiveCall handles signals directly
           if (currentView === 'active-call') return;
 
-          // Lookup caller name in saved contacts if available
+          // Ring opens the incoming-call UI before the camera/SDP are ready.
           let callerName = 'Remote Peer';
           try {
             const contacts = await loadContactsFromDb();
             const matched = contacts.find(
-              (c) => c.iroh_node_id.toLowerCase() === signal.sender?.toLowerCase()
+              (c) => c.iroh_node_id.toLowerCase() === sender.toLowerCase()
             );
-            if (matched) {
-              callerName = matched.name;
-            }
+            if (matched) callerName = matched.name;
           } catch (e) {
             console.warn('Could not load contacts to resolve caller name', e);
           }
 
-          setIncomingCall({
-            nodeId: signal.sender,
+          setIncomingCall((current) => ({
+            nodeId: sender,
             name: callerName,
-            offerSignal: signal,
-          });
+            offerSignal:
+              signal.type === 'offer'
+                ? signal
+                : current?.nodeId.toLowerCase() === sender.toLowerCase()
+                  ? current.offerSignal
+                  : null,
+          }));
         }
       } catch (e) {
         console.warn('Non-JSON incoming signal in App:', payloadString, e);
@@ -74,7 +88,7 @@ export default function App() {
   };
 
   const handleAcceptIncomingCall = useCallback(() => {
-    if (!incomingCall) return;
+    if (!incomingCall?.offerSignal) return;
 
     const contact: Contact = {
       iroh_node_id: incomingCall.nodeId,
@@ -91,16 +105,37 @@ export default function App() {
     setCurrentView('active-call');
   }, [incomingCall]);
 
-  const handleDeclineIncomingCall = () => {
+  const handleDeclineIncomingCall = useCallback(() => {
+    if (!incomingCall) return;
+    const remoteId = incomingCall.nodeId;
     setIncomingCall(null);
-  };
 
-  const handleEndCall = () => {
+    void getMyNodeId()
+      .then((sender) =>
+        sendSignal(
+          remoteId,
+          JSON.stringify({ type: 'hangup', reason: 'declined', sender })
+        )
+      )
+      .catch(() => {
+        // The caller may already have cancelled or gone offline.
+      });
+  }, [incomingCall]);
+
+  useEffect(() => {
+    if (!incomingCall) return;
+    const handleBeforeUnload = () => handleDeclineIncomingCall();
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [incomingCall, handleDeclineIncomingCall]);
+
+  const handleEndCall = useCallback(() => {
     setActiveContact(null);
     setIsIncomingCall(false);
     setInitialSignal(null);
+    setIncomingCall(null);
     setCurrentView('home');
-  };
+  }, []);
 
   return (
     <div className="min-h-screen w-full flex flex-col bg-zinc-950">
@@ -120,7 +155,7 @@ export default function App() {
             </p>
             <p className="text-sm text-violet-300 font-medium mt-3 flex items-center justify-center gap-1.5">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-              Incoming P2P Video Call...
+              {incomingCall.offerSignal ? 'Incoming P2P Video Call...' : 'Ringing... Preparing call'}
             </p>
 
             <div className="flex items-center justify-center gap-4 mt-6">
@@ -135,10 +170,11 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleAcceptIncomingCall}
-                className="flex items-center gap-2 px-6 py-3 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-950/50 transition-all hover:scale-105 active:scale-95 cursor-pointer"
+                disabled={!incomingCall.offerSignal}
+                className="flex items-center gap-2 px-6 py-3 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-950/50 transition-all hover:scale-105 active:scale-95 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
               >
                 <PhoneCall className="h-4 w-4" />
-                <span>Accept</span>
+                <span>{incomingCall.offerSignal ? 'Accept' : 'Connecting...'}</span>
               </button>
             </div>
           </div>

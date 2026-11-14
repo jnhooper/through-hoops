@@ -6,11 +6,16 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::RwLock;
 
 pub const SIGNALING_ALPN: &[u8] = b"/p2p-video-chat/signaling/0";
 const MAX_HANDSHAKE_BYTES: usize = 8 * 1024 * 1024;
+const SIGNAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HandshakePayload {
@@ -145,6 +150,7 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                     if let Err(err) = app_inner.emit("incoming_signal", &payload) {
                                         log::error!("Failed to emit incoming_signal event: {err}");
                                     }
+                                    let _ = send.finish();
                                 });
                             }
                             Err(err) => {
@@ -176,6 +182,7 @@ impl ProtocolHandler for SignalingProtocolHandler {
 
 pub struct SignalingState {
     pub endpoint: Endpoint,
+    pub connections: RwLock<HashMap<EndpointId, iroh::endpoint::Connection>>,
     pub _router: Router,
 }
 
@@ -230,6 +237,7 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
     let secret_key = load_or_create_secret_key(&app_handle).await?;
 
     let endpoint = Endpoint::builder(presets::N0)
+        .address_lookup(MdnsAddressLookup::builder())
         .secret_key(secret_key)
         .bind()
         .await
@@ -250,6 +258,7 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
 
     Ok(SignalingState {
         endpoint,
+        connections: RwLock::new(HashMap::new()),
         _router: router,
     })
 }
@@ -261,6 +270,52 @@ pub async fn get_my_node_id(
     Ok(state.endpoint.id().to_string())
 }
 
+async fn get_or_create_connection(
+    state: &SignalingState,
+    endpoint_id: EndpointId,
+    remote_id: &str,
+) -> std::result::Result<iroh::endpoint::Connection, String> {
+    let cached = state.connections.read().await.get(&endpoint_id).cloned();
+    if let Some(conn) = cached {
+        if conn.close_reason().is_none() {
+            return Ok(conn);
+        }
+        state.connections.write().await.remove(&endpoint_id);
+    }
+
+    let conn = match tokio::time::timeout(
+        SIGNAL_TIMEOUT,
+        state.endpoint.connect(endpoint_id, SIGNALING_ALPN),
+    )
+    .await
+    {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(err)) => {
+            tracing::warn!(peer = %remote_id, error = %err, "Peer unreachable during signaling dial");
+            return Err(format!(
+                "Failed to connect to remote node {remote_id}: {err}"
+            ));
+        }
+        Err(_) => {
+            tracing::warn!(peer = %remote_id, "Peer unreachable: signaling dial timed out");
+            return Err(format!(
+                "Peer {remote_id} is unreachable: connection timed out after 3 seconds"
+            ));
+        }
+    };
+
+    // Another signal may have dialed the same peer concurrently. Prefer an
+    // already-pooled live connection instead of replacing it unnecessarily.
+    let mut connections = state.connections.write().await;
+    if let Some(existing) = connections.get(&endpoint_id)
+        && existing.close_reason().is_none()
+    {
+        return Ok(existing.clone());
+    }
+    connections.insert(endpoint_id, conn.clone());
+    Ok(conn)
+}
+
 #[tauri::command]
 pub async fn send_signal(
     remote_id: String,
@@ -269,35 +324,21 @@ pub async fn send_signal(
 ) -> std::result::Result<(), String> {
     let endpoint_id = EndpointId::from_str(&remote_id)
         .map_err(|e| format!("Invalid remote Iroh node ID: {e}"))?;
+    let conn = get_or_create_connection(&state, endpoint_id, &remote_id).await?;
 
-    let conn = state
-        .endpoint
-        .connect(endpoint_id, SIGNALING_ALPN)
+    let (mut send, _recv) = tokio::time::timeout(SIGNAL_TIMEOUT, conn.open_bi())
         .await
-        .map_err(|e| format!("Failed to connect to remote node {remote_id}: {e}"))?;
-
-    let mut send = conn
-        .open_uni()
-        .await
+        .map_err(|_| format!("Timed out opening stream to remote node {remote_id}"))?
         .map_err(|e| format!("Failed to open stream to remote node: {e}"))?;
 
     send.write_all(payload.as_bytes())
         .await
         .map_err(|e| format!("Failed to write payload to stream: {e}"))?;
-
     send.finish()
         .map_err(|e| format!("Failed to finish stream: {e}"))?;
 
-    // `finish` only marks the stream as complete. Keep the connection alive until
-    // the peer acknowledges the data so dropping `conn` cannot discard the signal.
-    let stopped = send
-        .stopped()
-        .await
-        .map_err(|e| format!("Failed while waiting for signal delivery: {e}"))?;
-    if let Some(code) = stopped {
-        return Err(format!("Remote stopped the signal stream with code {code}"));
-    }
-
+    // The pooled connection stays alive after this stream finishes, allowing the
+    // next ICE candidate or call-control message to reuse it without another dial.
     Ok(())
 }
 
