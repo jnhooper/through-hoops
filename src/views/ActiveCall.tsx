@@ -64,6 +64,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   const isCallEndedRef = useRef<boolean>(false);
   const hasSentHangupRef = useRef<boolean>(false);
   const hasConnectedRef = useRef<boolean>(false);
+  const initializationIdRef = useRef(0);
   const disconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Timer
@@ -116,6 +117,13 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
 
     if (pcRef.current) {
       const pc = pcRef.current;
+      pc.getSenders().forEach((sender) => {
+        try {
+          sender.track?.stop();
+        } catch (e) {
+          console.warn('Error stopping WebRTC sender track:', e);
+        }
+      });
       pc.ontrack = null;
       pc.onicecandidate = null;
       pc.onconnectionstatechange = null;
@@ -208,6 +216,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   // Main WebRTC Initialization & Lifecycle
   useEffect(() => {
     let unlistenSignals: (() => void) | undefined;
+    const initializationId = ++initializationIdRef.current;
+    const isStaleInitialization = () =>
+      isCallEndedRef.current || initializationIdRef.current !== initializationId;
     isCallEndedRef.current = false;
     hasSentHangupRef.current = false;
     hasConnectedRef.current = false;
@@ -217,7 +228,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         // 1. Fetch our local Iroh Node ID for signaling headers
         const myId = await getMyNodeId();
         myNodeIdRef.current = myId;
-        if (isCallEndedRef.current) return;
+        if (isStaleInitialization()) return;
 
         // Ring before touching camera hardware so the peer can show its incoming
         // call UI immediately. The SDP offer follows once local media is ready.
@@ -230,32 +241,41 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
           });
         }
 
-        // 2. Capture Local Media (Camera & Mic)
+        // 2. Capture Local Media (Camera & Mic). Every await is followed by
+        // an immediate stale/unmounted check before the stream can be attached.
         let localStream: MediaStream;
         try {
-          localStream = await navigator.mediaDevices.getUserMedia({
+          const stream = await navigator.mediaDevices.getUserMedia({
             video: true,
             audio: true,
           });
+          if (isStaleInitialization()) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+          localStream = stream;
         } catch (mediaErr) {
           console.warn('Could not access user media with both video/audio:', mediaErr);
-          // Fallback to audio only or video only if one is missing
+          if (isStaleInitialization()) return;
+
+          // Fall back to audio only if video is unavailable.
           try {
-            localStream = await navigator.mediaDevices.getUserMedia({
+            const stream = await navigator.mediaDevices.getUserMedia({
               video: false,
               audio: true,
             });
+            if (isStaleInitialization()) {
+              stream.getTracks().forEach((track) => track.stop());
+              return;
+            }
+            localStream = stream;
             setIsVideoOff(true);
           } catch (audioOnlyErr) {
+            if (isStaleInitialization()) return;
             console.error('Failed to capture audio/video:', audioOnlyErr);
             setMediaError('Could not access camera or microphone.');
             localStream = new MediaStream();
           }
-        }
-
-        if (isCallEndedRef.current) {
-          localStream.getTracks().forEach((t) => t.stop());
-          return;
         }
 
         localStreamRef.current = localStream;
@@ -433,6 +453,8 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
     initWebRTC();
 
     return () => {
+      // Invalidate pending media requests before releasing the current streams.
+      initializationIdRef.current += 1;
       cleanup();
       if (unlistenSignals) {
         unlistenSignals();
@@ -486,7 +508,15 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
       setIsScreenSharing(false);
     } else {
       try {
+        const initializationId = initializationIdRef.current;
         const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        if (
+          isCallEndedRef.current ||
+          initializationIdRef.current !== initializationId
+        ) {
+          screenStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
 
