@@ -4,6 +4,31 @@ import { isTauriEnvironment } from './db';
 
 const MOCK_LOCAL_NODE_ID = 'local-node-8fa93c20b81e47d9023fbc8102a9';
 
+// The caller trickles ICE candidates as soon as it creates its offer, usually
+// while the callee is still on the incoming-call screen (or waiting on the
+// camera permission prompt) and has no RTCPeerConnection to add them to.
+// Dropping them leaves the callee unable to punch through NAT, so buffer them
+// per sender until ActiveCall drains them.
+const bufferedCandidates = new Map<string, RTCIceCandidateInit[]>();
+
+export function bufferCandidate(sender: string, candidate: RTCIceCandidateInit): void {
+  const key = sender.trim().toLowerCase();
+  const list = bufferedCandidates.get(key) ?? [];
+  list.push(candidate);
+  bufferedCandidates.set(key, list);
+}
+
+export function takeBufferedCandidates(sender: string): RTCIceCandidateInit[] {
+  const key = sender.trim().toLowerCase();
+  const list = bufferedCandidates.get(key) ?? [];
+  bufferedCandidates.delete(key);
+  return list;
+}
+
+export function clearBufferedCandidates(sender: string): void {
+  bufferedCandidates.delete(sender.trim().toLowerCase());
+}
+
 /**
  * Fetches the local Iroh node's public key / Node ID from the Rust backend.
  */

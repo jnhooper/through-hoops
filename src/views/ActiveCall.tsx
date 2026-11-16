@@ -15,7 +15,13 @@ import {
 } from 'lucide-react';
 import type { Contact } from '../types/contact';
 import type { HangupReason, SignalMessage } from '../types/signaling';
-import { getMyNodeId, sendSignal, listenForIncomingSignals } from '../services/signaling';
+import {
+  getMyNodeId,
+  sendSignal,
+  listenForIncomingSignals,
+  takeBufferedCandidates,
+  clearBufferedCandidates,
+} from '../services/signaling';
 
 interface ActiveCallProps {
   contact: Contact | null;
@@ -35,7 +41,32 @@ function describeCandidate(candidate: RTCIceCandidateInit): string {
   const raw = candidate.candidate || '';
   const type = raw.match(/\btyp\s+(\w+)/)?.[1] || 'unknown';
   const protocol = raw.match(/\b(udp|tcp)\b/i)?.[1].toUpperCase() || 'unknown';
-  return `${type}/${protocol}`;
+  // candidate:<foundation> <component> <protocol> <priority> <address> <port> typ ...
+  const address = raw.split(/\s+/)[4] || 'unknown';
+  const mdns = address.endsWith('.local') ? ' [mDNS-obfuscated]' : '';
+  return `${type}/${protocol} ${address}${mdns}`;
+}
+
+// Logs which candidate pair ICE selected or, on failure, every pair it tried.
+async function logIcePairs(pc: RTCPeerConnection, label: string): Promise<void> {
+  try {
+    const stats = await pc.getStats();
+    const byId = new Map<string, Record<string, unknown>>();
+    stats.forEach((s) => byId.set(s.id, s as Record<string, unknown>));
+    const fmt = (id: unknown) => {
+      const c = byId.get(String(id));
+      return c ? `${c.candidateType}/${c.protocol} ${c.address ?? c.ip}:${c.port}` : '?';
+    };
+    stats.forEach((s) => {
+      if (s.type !== 'candidate-pair') return;
+      const p = s as Record<string, unknown>;
+      console.info(
+        `[DEBUG-ice] ${label} pair ${fmt(p.localCandidateId)} -> ${fmt(p.remoteCandidateId)} state=${p.state} nominated=${p.nominated}`
+      );
+    });
+  } catch (err) {
+    console.warn('[DEBUG-ice] getStats failed:', err);
+  }
 }
 
 export const ActiveCall: React.FC<ActiveCallProps> = ({
@@ -68,6 +99,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   const myNodeIdRef = useRef<string>('');
   const remoteNodeIdRef = useRef<string>(contact?.iroh_node_id || initialSignal?.sender || '');
   const iceCandidatesQueueRef = useRef<RTCIceCandidateInit[]>([]);
+  const seenRemoteCandidatesRef = useRef<Set<string>>(new Set());
   const isCallEndedRef = useRef<boolean>(false);
   const hasSentHangupRef = useRef<boolean>(false);
   const hasConnectedRef = useRef<boolean>(false);
@@ -145,6 +177,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
     }
 
     iceCandidatesQueueRef.current = [];
+    seenRemoteCandidatesRef.current.clear();
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
   }, [clearDisconnectTimeout]);
@@ -154,6 +187,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   const cleanupCall = useCallback(() => {
     if (isCallEndedRef.current) return;
     cleanup();
+    // Only on a real call end — React effect teardown (StrictMode) must not
+    // discard candidates the remount still needs.
+    if (remoteNodeIdRef.current) clearBufferedCandidates(remoteNodeIdRef.current);
     onEndCall();
   }, [cleanup, onEndCall]);
 
@@ -282,7 +318,11 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
           } catch (audioOnlyErr) {
             if (isStaleInitialization()) return;
             console.error('Failed to capture audio/video:', audioOnlyErr);
-            setMediaError('Could not access camera or microphone.');
+            setMediaError(
+              window.isSecureContext && navigator.mediaDevices
+                ? 'Could not access camera or microphone.'
+                : 'Camera/microphone unavailable: page is not a secure context.'
+            );
             localStream = new MediaStream();
           }
         }
@@ -301,6 +341,20 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         localStream.getTracks().forEach((track) => {
           pc.addTrack(track, localStream);
         });
+
+        // If camera/mic capture failed (permission denied, or no
+        // navigator.mediaDevices in an insecure context such as an Android dev
+        // build served from http://<lan-ip>:5173), the offer would contain no
+        // media sections and ICE would never start. The caller always
+        // negotiates audio+video so the call still connects and receives.
+        // The callee must not do this: transceivers created by addTransceiver
+        // are not matched to the remote offer's m-lines.
+        if (!isIncoming) {
+          for (const kind of ['audio', 'video'] as const) {
+            const hasKind = pc.getTransceivers().some((t) => t.receiver.track.kind === kind);
+            if (!hasKind) pc.addTransceiver(kind, { direction: 'recvonly' });
+          }
+        }
 
         // 4. Handle incoming remote tracks
         pc.ontrack = (event) => {
@@ -339,6 +393,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
 
         pc.oniceconnectionstatechange = () => {
           console.info('[DEBUG-ice] ICE connection state:', pc.iceConnectionState);
+          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'failed') {
+            void logIcePairs(pc, pc.iceConnectionState);
+          }
         };
         pc.onicegatheringstatechange = () => {
           console.info('[DEBUG-ice] ICE gathering state:', pc.iceGatheringState);
@@ -420,6 +477,10 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
               );
               await flushIceQueue();
             } else if (signal.type === 'candidate' && signal.candidate) {
+              // Candidates can arrive both live and from the App-level buffer.
+              const key = `${signal.candidate.sdpMid ?? ''}|${signal.candidate.candidate ?? ''}`;
+              if (seenRemoteCandidatesRef.current.has(key)) return;
+              seenRemoteCandidatesRef.current.add(key);
               console.info('[DEBUG-ice] Remote candidate:', describeCandidate(signal.candidate));
               if (currentPc.remoteDescription && currentPc.remoteDescription.type) {
                 await currentPc.addIceCandidate(new RTCIceCandidate(signal.candidate));
@@ -444,6 +505,21 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
             console.warn('[WebRTC] Received non-JSON signal payload:', payloadString, e);
           }
         });
+        if (isStaleInitialization()) {
+          // Unmounted while listen() was pending; the effect cleanup already ran.
+          unlistenSignals();
+          unlistenSignals = undefined;
+          return;
+        }
+
+        // Replay candidates that arrived before this listener existed (e.g.
+        // while the incoming-call screen or camera permission prompt was up).
+        // They queue until the remote description is set.
+        if (remoteNodeIdRef.current) {
+          for (const candidate of takeBufferedCandidates(remoteNodeIdRef.current)) {
+            await handleSignalMessage({ type: 'candidate', candidate });
+          }
+        }
 
         // 8. If receiver launched with an initial offer signal, handle it immediately
         if (isIncoming && initialSignal) {

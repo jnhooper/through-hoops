@@ -3,7 +3,13 @@ import type { Contact } from './types/contact';
 import type { SignalMessage } from './types/signaling';
 import { Home } from './views/Home';
 import { ActiveCall } from './views/ActiveCall';
-import { getMyNodeId, listenForIncomingSignals, sendSignal } from './services/signaling';
+import {
+  bufferCandidate,
+  clearBufferedCandidates,
+  getMyNodeId,
+  listenForIncomingSignals,
+  sendSignal,
+} from './services/signaling';
 import { loadContactsFromDb } from './services/db';
 import { Video, PhoneOff, PhoneCall } from 'lucide-react';
 
@@ -24,13 +30,23 @@ export default function App() {
 
   // Global listener for incoming calls when user is in home view
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
 
     listenForIncomingSignals(async (payloadString: string) => {
       try {
         const signal = JSON.parse(payloadString) as SignalMessage;
+        if (signal.type === 'candidate') {
+          // Always buffer, even mid-call: ActiveCall dedupes, and this covers
+          // the gap before its own listener is registered.
+          if (signal.sender && signal.candidate) {
+            bufferCandidate(signal.sender, signal.candidate);
+          }
+          return;
+        }
         if (signal.type === 'hangup') {
           if (signal.sender) {
+            clearBufferedCandidates(signal.sender);
             const sender = signal.sender.toLowerCase();
             setIncomingCall((pending) =>
               pending && pending.nodeId.toLowerCase() === sender ? null : pending
@@ -43,6 +59,9 @@ export default function App() {
         if ((signal.type === 'ring' || signal.type === 'offer') && sender) {
           // If already in an active call, ActiveCall handles signals directly
           if (currentView === 'active-call') return;
+
+          // A ring starts a fresh call; discard leftovers from an earlier one.
+          if (signal.type === 'ring') clearBufferedCandidates(sender);
 
           // Ring opens the incoming-call UI before the camera/SDP are ready.
           let callerName = 'Remote Peer';
@@ -71,11 +90,15 @@ export default function App() {
         console.warn('Non-JSON incoming signal in App:', payloadString, e);
       }
     }).then((cleanup) => {
-      unlisten = cleanup;
+      // If the effect was torn down before listen() resolved (StrictMode, or a
+      // view change), drop the listener instead of leaking a duplicate.
+      if (disposed) cleanup();
+      else unlisten = cleanup;
     });
 
     return () => {
-      if (unlisten) unlisten();
+      disposed = true;
+      unlisten?.();
     };
   }, [currentView]);
 
@@ -109,6 +132,7 @@ export default function App() {
     if (!incomingCall) return;
     const remoteId = incomingCall.nodeId;
     setIncomingCall(null);
+    clearBufferedCandidates(remoteId);
 
     void getMyNodeId()
       .then((sender) =>
