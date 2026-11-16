@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointId, SecretKey};
-use iroh_mdns_address_lookup::MdnsAddressLookup;
+use iroh_mdns_peer_lookup::Options as MdnsOptions;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -236,8 +236,11 @@ async fn load_or_create_secret_key(app_handle: &AppHandle) -> Result<SecretKey> 
 pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
     let secret_key = load_or_create_secret_key(&app_handle).await?;
 
+    let mdns = iroh_mdns_peer_lookup::lookup(MdnsOptions::new().build())
+        .await
+        .context("Failed to initialize mDNS peer lookup")?;
     let endpoint = Endpoint::builder(presets::N0)
-        .address_lookup(MdnsAddressLookup::builder())
+        .address_lookup(mdns)
         .secret_key(secret_key)
         .bind()
         .await

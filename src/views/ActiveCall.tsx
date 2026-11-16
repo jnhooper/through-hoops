@@ -31,6 +31,13 @@ const RTC_CONFIG: RTCConfiguration = {
   ],
 };
 
+function describeCandidate(candidate: RTCIceCandidateInit): string {
+  const raw = candidate.candidate || '';
+  const type = raw.match(/\btyp\s+(\w+)/)?.[1] || 'unknown';
+  const protocol = raw.match(/\b(udp|tcp)\b/i)?.[1].toUpperCase() || 'unknown';
+  return `${type}/${protocol}`;
+}
+
 export const ActiveCall: React.FC<ActiveCallProps> = ({
   contact,
   onEndCall,
@@ -126,6 +133,8 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
       });
       pc.ontrack = null;
       pc.onicecandidate = null;
+      pc.oniceconnectionstatechange = null;
+      pc.onicegatheringstatechange = null;
       pc.onconnectionstatechange = null;
       try {
         pc.close();
@@ -306,6 +315,11 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
 
         // 5. ICE Candidate Exchange: emit candidates over send_signal
         pc.onicecandidate = async (event) => {
+          if (!event.candidate) {
+            console.info('[DEBUG-ice] Local candidate gathering complete');
+          } else {
+            console.info('[DEBUG-ice] Local candidate:', describeCandidate(event.candidate));
+          }
           if (event.candidate && !isCallEndedRef.current) {
             const destNodeId = remoteNodeIdRef.current;
             if (destNodeId) {
@@ -321,6 +335,13 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
               }
             }
           }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          console.info('[DEBUG-ice] ICE connection state:', pc.iceConnectionState);
+        };
+        pc.onicegatheringstatechange = () => {
+          console.info('[DEBUG-ice] ICE gathering state:', pc.iceGatheringState);
         };
 
         // Track connection state and recover briefly from transient disconnects.
@@ -399,6 +420,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
               );
               await flushIceQueue();
             } else if (signal.type === 'candidate' && signal.candidate) {
+              console.info('[DEBUG-ice] Remote candidate:', describeCandidate(signal.candidate));
               if (currentPc.remoteDescription && currentPc.remoteDescription.type) {
                 await currentPc.addIceCandidate(new RTCIceCandidate(signal.candidate));
               } else {

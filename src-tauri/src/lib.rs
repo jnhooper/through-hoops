@@ -7,6 +7,13 @@ pub mod signaling;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install the Rustls Ring crypto provider");
+
+    // SAFETY: this runs before Tauri, Tokio, or Iroh starts any worker threads.
+    unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+
     // Define the database schema creation
     let migrations = vec![
         Migration {
@@ -37,7 +44,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
-                .build()
+                .build(),
         )
         // .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
