@@ -95,6 +95,16 @@ pub async fn save_local_profile(
     photo_path: Option<String>,
     app: AppHandle,
 ) -> Result<LocalProfile, String> {
+    // The profile photo is sent to every peer, so only accept files inside our
+    // own avatars directory (see avatar::ensure_within_dir).
+    let photo_path = match photo_path.filter(|p| !p.trim().is_empty()) {
+        Some(path) => {
+            let dir = avatars::avatars_dir(&app)?;
+            let canonical = avatars::ensure_within_dir(std::path::Path::new(&path), &dir).await?;
+            Some(canonical.to_string_lossy().to_string())
+        }
+        None => None,
+    };
     upsert_local_profile(&app, &name, photo_path.as_deref())
         .await
         .map_err(|e| format!("Failed to save local profile: {e}"))

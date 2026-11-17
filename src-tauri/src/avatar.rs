@@ -68,26 +68,65 @@ fn detect_image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Canonicalizes `path` and returns it only if it lies inside `dir`. The local
+/// profile's photo is sent to every peer, so it must never point elsewhere.
+pub async fn ensure_within_dir(path: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let canonical_dir = tokio::fs::canonicalize(dir)
+        .await
+        .map_err(|err| format!("Avatar directory {} is unavailable: {err}", dir.display()))?;
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|err| format!("Photo path {} is not readable: {err}", path.display()))?;
+    if canonical.starts_with(&canonical_dir) && canonical != canonical_dir {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "Photo path {} must be inside {}",
+            path.display(),
+            dir.display()
+        ))
+    }
+}
+
 /// Reads the local avatar for an outbound handshake. Missing or invalid avatars
 /// are omitted so they never prevent the exchange of profile names.
-pub async fn load_local_avatar(photo_path: Option<&str>) -> Option<AvatarPayload> {
-    let path = photo_path?;
+pub async fn load_local_avatar<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    photo_path: Option<&str>,
+) -> Option<AvatarPayload> {
+    let requested = photo_path?;
+    // Defense in depth: save_local_profile already enforces this.
+    let checked = match avatars_dir(app) {
+        Ok(dir) => ensure_within_dir(Path::new(requested), &dir).await,
+        Err(err) => Err(err),
+    };
+    let path_buf = match checked {
+        Ok(path) => path,
+        Err(err) => {
+            log::warn!("Not sending local avatar: {err}");
+            return None;
+        }
+    };
+    let path = path_buf.as_path();
+    let path_display = path.display();
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
         Err(err) => {
-            log::warn!("Unable to read local avatar metadata at {path}: {err}");
+            log::warn!("Unable to read local avatar metadata at {path_display}: {err}");
             return None;
         }
     };
     if metadata.len() > MAX_AVATAR_BYTES as u64 {
-        log::warn!("Local avatar at {path} exceeds the size limit; sending profile without it");
+        log::warn!(
+            "Local avatar at {path_display} exceeds the size limit; sending profile without it"
+        );
         return None;
     }
 
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            log::warn!("Unable to read local avatar at {path}: {err}");
+            log::warn!("Unable to read local avatar at {path_display}: {err}");
             return None;
         }
     };
@@ -95,7 +134,7 @@ pub async fn load_local_avatar(photo_path: Option<&str>) -> Option<AvatarPayload
     match AvatarPayload::from_bytes(&bytes) {
         Ok(avatar) => Some(avatar),
         Err(err) => {
-            log::warn!("Unable to send local avatar at {path}: {err}");
+            log::warn!("Unable to send local avatar at {path_display}: {err}");
             None
         }
     }
@@ -361,6 +400,24 @@ mod tests {
             file_names(&dir),
             vec!["contact-keep.png".to_string(), "profile.png".to_string()]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn photo_path_outside_avatar_dir_is_rejected() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let inside = dir.join("profile.png");
+        std::fs::write(&inside, PNG_HEADER).unwrap();
+
+        assert!(ensure_within_dir(&inside, &dir).await.is_ok());
+        assert!(
+            ensure_within_dir(Path::new("/etc/hosts"), &dir)
+                .await
+                .is_err()
+        );
+        assert!(ensure_within_dir(&dir.join("../"), &dir).await.is_err());
+        assert!(ensure_within_dir(&dir, &dir).await.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

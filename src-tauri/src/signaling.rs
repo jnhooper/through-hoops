@@ -99,7 +99,7 @@ async fn local_handshake(app: &AppHandle, node_id: String) -> Result<HandshakePa
     let profile = db::query_local_profile(app)
         .await
         .map_err(|err| format!("Failed to read local profile: {err}"))?;
-    let photo = load_local_avatar(profile.photo_path.as_deref()).await;
+    let photo = load_local_avatar(app, profile.photo_path.as_deref()).await;
 
     Ok(HandshakePayload {
         msg_type: "handshake".to_string(),
