@@ -477,3 +477,36 @@ _(implementing agent: append here)_
   before, so that caller waits until their own call times out.
 - **Formatting.** `cargo fmt --check` fails on code that was already there,
   such as `build.rs`. Only the files changed in this branch were formatted.
+
+### Phases 3–4
+
+- **Status (3.1–4.6 done).** Needs device or build verification, not done:
+  - **3.1:** a first-contact handshake across networks (cellular to Wi-Fi) that
+    needs more than 3 s to dial.
+  - **3.2:** the banner and error paths. I did not force an endpoint bind
+    failure, so only `Networking::unavailable` is unit-tested.
+  - **4.2:** a real release build. I checked the wiring with `--dry-run` and
+    the failure path by running `requireReleaseSigning` with the keystore
+    file temporarily moved away; I did not run a full signed build.
+  - **4.5:** on a macOS build, that the Local Network prompt appears and mDNS
+    discovery works with `_irohv1._udp` declared.
+- **3.2 leaves one startup failure fatal.** If the SQLite database can't be
+  opened in `setup` (2.1), the app still fails to start. I left that as is,
+  since nothing useful works without the database, but it is a product call.
+- **3.1 reuses pooled connections for handshakes.** A pooled connection to a
+  peer that has restarted may not look closed yet, so the first handshake to it
+  can run into the 15 s timeout instead of redialing. The error says so; the
+  next attempt redials.
+- **4.1 needed almost no code changes.** The project already type-checked
+  cleanly under strict. Only three `!` assertions were replaced (`Home.tsx`
+  recents sort, `main.tsx` root lookup).
+- **4.3 covers logic only.** The vitest tests don't render React components, so
+  the 1.2 busy/ignore behavior in `App.tsx` is verified by `isFromPeer` tests
+  and by reading, not by a component test.
+- **Still named `p2p-video-chat`:** `index.html`'s `<title>` (outside 4.6's
+  list), and `SIGNALING_ALPN` in `signaling.rs`. The ALPN must stay: it's the
+  wire protocol identifier.
+- **4.6 `authors`** is set to the git author name ("John Hooper"), without an
+  email. Change it if a different name or attribution is wanted.
+- **README claim to verify:** it says camera access in `tauri android dev`
+  is unverified. Nobody has tested that on this Tauri CLI version.
