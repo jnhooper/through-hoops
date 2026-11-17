@@ -16,7 +16,13 @@ use tokio::sync::RwLock;
 
 pub const SIGNALING_ALPN: &[u8] = b"/p2p-video-chat/signaling/0";
 const MAX_HANDSHAKE_BYTES: usize = 8 * 1024 * 1024;
+/// Opening a stream on an already-established connection.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// First dial to a peer. Across networks this goes through discovery and the
+/// n0 relay, which can take well over 3 s on cellular.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole `perform_handshake` exchange: dial, stream, and the peer's reply.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HandshakePayload {
@@ -355,7 +361,7 @@ async fn get_or_create_connection(
     }
 
     let conn = match tokio::time::timeout(
-        SIGNAL_TIMEOUT,
+        DIAL_TIMEOUT,
         state.endpoint.connect(endpoint_id, SIGNALING_ALPN),
     )
     .await
@@ -370,7 +376,8 @@ async fn get_or_create_connection(
         Err(_) => {
             tracing::warn!(peer = %remote_id, "Peer unreachable: signaling dial timed out");
             return Err(format!(
-                "Peer {remote_id} is unreachable: connection timed out after 3 seconds"
+                "Peer {remote_id} is unreachable: connection timed out after {} seconds",
+                DIAL_TIMEOUT.as_secs()
             ));
         }
     };
@@ -429,28 +436,34 @@ pub async fn perform_handshake(
     let payload_bytes = serde_json::to_vec(&handshake_payload)
         .map_err(|err| format!("Failed to serialize handshake payload: {err}"))?;
 
-    let conn = state
-        .endpoint
-        .connect(endpoint_id, SIGNALING_ALPN)
-        .await
-        .map_err(|err| format!("Failed to connect to remote node {remote_id}: {err}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|err| format!("Failed to open handshake stream: {err}"))?;
+    let exchange = async {
+        let conn = get_or_create_connection(&state, endpoint_id, &remote_id).await?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|err| format!("Failed to open handshake stream: {err}"))?;
 
-    send.write_all(&payload_bytes)
-        .await
-        .map_err(|err| format!("Failed to send handshake: {err}"))?;
-    send.finish()
-        .map_err(|err| format!("Failed to finish handshake stream: {err}"))?;
+        send.write_all(&payload_bytes)
+            .await
+            .map_err(|err| format!("Failed to send handshake: {err}"))?;
+        send.finish()
+            .map_err(|err| format!("Failed to finish handshake stream: {err}"))?;
 
-    let response_bytes = recv
-        .read_to_end(MAX_HANDSHAKE_BYTES)
+        let response_bytes = recv
+            .read_to_end(MAX_HANDSHAKE_BYTES)
+            .await
+            .map_err(|err| format!("Failed to read handshake response: {err}"))?;
+        serde_json::from_slice::<HandshakePayload>(&response_bytes)
+            .map_err(|err| format!("Invalid handshake response: {err}"))
+    };
+    let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange)
         .await
-        .map_err(|err| format!("Failed to read handshake response: {err}"))?;
-    let response = serde_json::from_slice::<HandshakePayload>(&response_bytes)
-        .map_err(|err| format!("Invalid handshake response: {err}"))?;
+        .map_err(|_| {
+            format!(
+                "Handshake with {remote_id} timed out after {} seconds",
+                HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })??;
     if response.msg_type != "handshake" {
         return Err("Peer returned an invalid handshake response".to_string());
     }
