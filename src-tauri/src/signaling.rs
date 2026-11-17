@@ -7,15 +7,22 @@ use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_mdns_peer_lookup::Options as MdnsOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 
 pub const SIGNALING_ALPN: &[u8] = b"/p2p-video-chat/signaling/0";
 const MAX_HANDSHAKE_BYTES: usize = 8 * 1024 * 1024;
+/// Opening a stream on an already-established connection.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// First dial to a peer. Across networks this goes through discovery and the
+/// n0 relay, which can take well over 3 s on cellular.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole `perform_handshake` exchange: dial, stream, and the peer's reply.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HandshakePayload {
@@ -34,10 +41,55 @@ pub struct HandshakeResult {
     pub remote_photo_path: Option<String>,
 }
 
+/// Envelope for `incoming_signal` events. `from` is the peer ID authenticated by
+/// the iroh connection; the frontend must route on it and ignore any `sender`
+/// field inside `payload`, which the remote peer controls.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IncomingSignal {
+    pub from: String,
+    pub payload: String,
+}
+
+const HANDSHAKE_PEER_INTERVAL: Duration = Duration::from_secs(10);
+const HANDSHAKE_GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+const HANDSHAKE_GLOBAL_LIMIT: usize = 30;
+
+/// Limits how often inbound handshakes may write contacts and avatars: at most
+/// one per peer per 10 s, and 30 in total per minute. Rejected handshakes are
+/// still answered so the caller's `perform_handshake` doesn't hang.
+#[derive(Debug, Default)]
+pub struct HandshakeLimiter {
+    last_by_peer: HashMap<EndpointId, Instant>,
+    recent: VecDeque<Instant>,
+}
+
+impl HandshakeLimiter {
+    pub fn allow(&mut self, peer: EndpointId, now: Instant) -> bool {
+        // Prune so memory stays bounded however many identities connect.
+        self.last_by_peer
+            .retain(|_, last| now.duration_since(*last) < HANDSHAKE_PEER_INTERVAL);
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= HANDSHAKE_GLOBAL_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+
+        if self.last_by_peer.contains_key(&peer) || self.recent.len() >= HANDSHAKE_GLOBAL_LIMIT {
+            return false;
+        }
+        self.last_by_peer.insert(peer, now);
+        self.recent.push_back(now);
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SignalingProtocolHandler {
     app_handle: AppHandle,
     local_node_id: String,
+    handshake_limiter: Arc<Mutex<HandshakeLimiter>>,
 }
 
 fn normalized_name(name: &str) -> String {
@@ -50,10 +102,10 @@ fn normalized_name(name: &str) -> String {
 }
 
 async fn local_handshake(app: &AppHandle, node_id: String) -> Result<HandshakePayload, String> {
-    let profile = db::query_local_profile(app)
+    let profile = db::query_local_profile(&app.state::<db::Db>().0)
         .await
         .map_err(|err| format!("Failed to read local profile: {err}"))?;
-    let photo = load_local_avatar(profile.photo_path.as_deref()).await;
+    let photo = load_local_avatar(app, profile.photo_path.as_deref()).await;
 
     Ok(HandshakePayload {
         msg_type: "handshake".to_string(),
@@ -63,12 +115,15 @@ async fn local_handshake(app: &AppHandle, node_id: String) -> Result<HandshakePa
     })
 }
 
+// TODO(product): any peer that knows our node ID is auto-added as a contact.
+// Should an unknown peer's handshake require user approval instead?
 async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &HandshakePayload) {
     // The connection authenticates the peer ID; never trust the self-declared payload ID.
-    let photo_path = save_received_avatar(app, handshake.photo.as_ref()).await;
+    let photo_path = save_received_avatar(app, remote_id, handshake.photo.as_ref()).await;
     let name = normalized_name(&handshake.name);
 
-    match db::upsert_contact(app, remote_id, &name, photo_path.as_deref()).await {
+    let pool = app.state::<db::Db>().0.clone();
+    match db::upsert_contact(&pool, remote_id, &name, photo_path.as_deref()).await {
         Ok(()) => {
             log::info!("Added or updated contact for peer {remote_id}");
             if let Err(err) = app.emit("contacts_changed", ()) {
@@ -79,6 +134,10 @@ async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &Han
     }
 }
 
+// Unidirectional-stream signaling. `send_signal` sends over bidirectional
+// streams, so nothing in this app opens a uni stream today; the receive path is
+// kept for compatibility with peers or builds that signal over uni streams, and
+// because it is harmless. It is exercised only by the tests below.
 async fn forward_uni_signal<R: tauri::Runtime>(
     app: AppHandle<R>,
     peer: String,
@@ -88,7 +147,11 @@ async fn forward_uni_signal<R: tauri::Runtime>(
         Ok(bytes) => {
             let payload = String::from_utf8_lossy(&bytes).to_string();
             log::info!("Received signal ({} bytes) from {peer}", payload.len());
-            if let Err(err) = app.emit("incoming_signal", &payload) {
+            let signal = IncomingSignal {
+                from: peer,
+                payload,
+            };
+            if let Err(err) = app.emit("incoming_signal", &signal) {
                 log::error!("Failed to emit incoming_signal event: {err}");
             }
         }
@@ -103,8 +166,10 @@ impl ProtocolHandler for SignalingProtocolHandler {
     ) -> std::result::Result<(), AcceptError> {
         let app = self.app_handle.clone();
         let local_node_id = self.local_node_id.clone();
+        let limiter = self.handshake_limiter.clone();
         tokio::spawn(async move {
-            let remote_id = connection.remote_id().to_string();
+            let remote_endpoint = connection.remote_id();
+            let remote_id = remote_endpoint.to_string();
             log::info!("Accepted Iroh connection from {remote_id}");
 
             loop {
@@ -115,6 +180,7 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                 let app_inner = app.clone();
                                 let peer = remote_id.clone();
                                 let local_id = local_node_id.clone();
+                                let limiter = limiter.clone();
                                 tokio::spawn(async move {
                                     let bytes = match recv.read_to_end(MAX_HANDSHAKE_BYTES).await {
                                         Ok(bytes) => bytes,
@@ -129,7 +195,15 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                         && handshake.msg_type == "handshake"
                                     {
                                         log::info!("Received handshake from peer {}: {}", peer, handshake.name);
-                                        save_incoming_contact(&app_inner, &peer, &handshake).await;
+                                        let allowed = limiter
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .allow(remote_endpoint, Instant::now());
+                                        if allowed {
+                                            save_incoming_contact(&app_inner, &peer, &handshake).await;
+                                        } else {
+                                            log::warn!("Rate-limited handshake from {peer}; replying without saving");
+                                        }
 
                                         match local_handshake(&app_inner, local_id).await {
                                             Ok(reply) => match serde_json::to_vec(&reply) {
@@ -146,8 +220,11 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                         return;
                                     }
 
-                                    let payload = String::from_utf8_lossy(&bytes).to_string();
-                                    if let Err(err) = app_inner.emit("incoming_signal", &payload) {
+                                    let signal = IncomingSignal {
+                                        from: peer,
+                                        payload: String::from_utf8_lossy(&bytes).to_string(),
+                                    };
+                                    if let Err(err) = app_inner.emit("incoming_signal", &signal) {
                                         log::error!("Failed to emit incoming_signal event: {err}");
                                     }
                                     let _ = send.finish();
@@ -184,6 +261,31 @@ pub struct SignalingState {
     pub endpoint: Endpoint,
     pub connections: RwLock<HashMap<EndpointId, iroh::endpoint::Connection>>,
     pub _router: Router,
+}
+
+/// Managed state for the signaling node. It always exists, so commands never
+/// hit an unmanaged-state panic: if the node failed to start, the app still
+/// runs and signaling commands return the startup error.
+pub struct Networking(std::result::Result<SignalingState, String>);
+
+impl Networking {
+    pub fn ready(state: SignalingState) -> Self {
+        Self(Ok(state))
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self(Err(reason.into()))
+    }
+
+    pub fn get(&self) -> std::result::Result<&SignalingState, String> {
+        self.0
+            .as_ref()
+            .map_err(|reason| format!("Networking unavailable: {reason}"))
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.0.as_ref().err().map(String::as_str)
+    }
 }
 
 /// Loads an existing 32-byte secret key from `<app_data_dir>/node_secret.key`,
@@ -236,12 +338,14 @@ async fn load_or_create_secret_key(app_handle: &AppHandle) -> Result<SecretKey> 
 pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
     let secret_key = load_or_create_secret_key(&app_handle).await?;
 
-    let mdns = iroh_mdns_peer_lookup::lookup(MdnsOptions::new().build())
-        .await
-        .context("Failed to initialize mDNS peer lookup")?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .address_lookup(mdns)
-        .secret_key(secret_key)
+    let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+    // Local-network discovery is optional: without it peers are still reachable
+    // through the relay and discovery service, just not by mDNS.
+    match iroh_mdns_peer_lookup::lookup(MdnsOptions::new().build()).await {
+        Ok(mdns) => builder = builder.address_lookup(mdns),
+        Err(err) => log::warn!("mDNS peer lookup unavailable, continuing without it: {err:#}"),
+    }
+    let endpoint = builder
         .bind()
         .await
         .context("Failed to bind Iroh endpoint")?;
@@ -255,6 +359,7 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
             SignalingProtocolHandler {
                 app_handle,
                 local_node_id,
+                handshake_limiter: Arc::new(Mutex::new(HandshakeLimiter::default())),
             },
         )
         .spawn();
@@ -268,9 +373,17 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
 
 #[tauri::command]
 pub async fn get_my_node_id(
-    state: State<'_, SignalingState>,
+    networking: State<'_, Networking>,
 ) -> std::result::Result<String, String> {
-    Ok(state.endpoint.id().to_string())
+    Ok(networking.get()?.endpoint.id().to_string())
+}
+
+/// Why networking failed to start, or `None` when it is running.
+#[tauri::command]
+pub fn networking_error(networking: State<'_, Networking>) -> Option<String> {
+    networking
+        .error()
+        .map(|reason| format!("Networking unavailable: {reason}"))
 }
 
 async fn get_or_create_connection(
@@ -287,7 +400,7 @@ async fn get_or_create_connection(
     }
 
     let conn = match tokio::time::timeout(
-        SIGNAL_TIMEOUT,
+        DIAL_TIMEOUT,
         state.endpoint.connect(endpoint_id, SIGNALING_ALPN),
     )
     .await
@@ -302,7 +415,8 @@ async fn get_or_create_connection(
         Err(_) => {
             tracing::warn!(peer = %remote_id, "Peer unreachable: signaling dial timed out");
             return Err(format!(
-                "Peer {remote_id} is unreachable: connection timed out after 3 seconds"
+                "Peer {remote_id} is unreachable: connection timed out after {} seconds",
+                DIAL_TIMEOUT.as_secs()
             ));
         }
     };
@@ -323,11 +437,12 @@ async fn get_or_create_connection(
 pub async fn send_signal(
     remote_id: String,
     payload: String,
-    state: State<'_, SignalingState>,
+    networking: State<'_, Networking>,
 ) -> std::result::Result<(), String> {
+    let state = networking.get()?;
     let endpoint_id = EndpointId::from_str(&remote_id)
         .map_err(|e| format!("Invalid remote Iroh node ID: {e}"))?;
-    let conn = get_or_create_connection(&state, endpoint_id, &remote_id).await?;
+    let conn = get_or_create_connection(state, endpoint_id, &remote_id).await?;
 
     let (mut send, _recv) = tokio::time::timeout(SIGNAL_TIMEOUT, conn.open_bi())
         .await
@@ -349,8 +464,9 @@ pub async fn send_signal(
 pub async fn perform_handshake(
     remote_id: String,
     app: AppHandle,
-    state: State<'_, SignalingState>,
+    networking: State<'_, Networking>,
 ) -> std::result::Result<HandshakeResult, String> {
+    let state = networking.get()?;
     let endpoint_id = EndpointId::from_str(&remote_id)
         .map_err(|err| format!("Invalid remote Iroh node ID: {err}"))?;
     if endpoint_id == state.endpoint.id() {
@@ -361,33 +477,40 @@ pub async fn perform_handshake(
     let payload_bytes = serde_json::to_vec(&handshake_payload)
         .map_err(|err| format!("Failed to serialize handshake payload: {err}"))?;
 
-    let conn = state
-        .endpoint
-        .connect(endpoint_id, SIGNALING_ALPN)
-        .await
-        .map_err(|err| format!("Failed to connect to remote node {remote_id}: {err}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|err| format!("Failed to open handshake stream: {err}"))?;
+    let exchange = async {
+        let conn = get_or_create_connection(state, endpoint_id, &remote_id).await?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|err| format!("Failed to open handshake stream: {err}"))?;
 
-    send.write_all(&payload_bytes)
-        .await
-        .map_err(|err| format!("Failed to send handshake: {err}"))?;
-    send.finish()
-        .map_err(|err| format!("Failed to finish handshake stream: {err}"))?;
+        send.write_all(&payload_bytes)
+            .await
+            .map_err(|err| format!("Failed to send handshake: {err}"))?;
+        send.finish()
+            .map_err(|err| format!("Failed to finish handshake stream: {err}"))?;
 
-    let response_bytes = recv
-        .read_to_end(MAX_HANDSHAKE_BYTES)
+        let response_bytes = recv
+            .read_to_end(MAX_HANDSHAKE_BYTES)
+            .await
+            .map_err(|err| format!("Failed to read handshake response: {err}"))?;
+        serde_json::from_slice::<HandshakePayload>(&response_bytes)
+            .map_err(|err| format!("Invalid handshake response: {err}"))
+    };
+    let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange)
         .await
-        .map_err(|err| format!("Failed to read handshake response: {err}"))?;
-    let response = serde_json::from_slice::<HandshakePayload>(&response_bytes)
-        .map_err(|err| format!("Invalid handshake response: {err}"))?;
+        .map_err(|_| {
+            format!(
+                "Handshake with {remote_id} timed out after {} seconds",
+                HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })??;
     if response.msg_type != "handshake" {
         return Err("Peer returned an invalid handshake response".to_string());
     }
 
-    let remote_photo_path = save_received_avatar(&app, response.photo.as_ref()).await;
+    let remote_photo_path =
+        save_received_avatar(&app, &endpoint_id.to_string(), response.photo.as_ref()).await;
     Ok(HandshakeResult {
         remote_node_id: remote_id,
         remote_name: Some(normalized_name(&response.name)),
@@ -414,11 +537,50 @@ mod tests {
             let app = self.app.clone();
             tokio::spawn(async move {
                 if let Ok(recv) = connection.accept_uni().await {
-                    forward_uni_signal(app, "test-peer".to_string(), recv).await;
+                    let peer = connection.remote_id().to_string();
+                    forward_uni_signal(app, peer, recv).await;
                 }
             });
             Ok(())
         }
+    }
+
+    #[test]
+    fn unavailable_networking_reports_the_startup_error() {
+        let networking = Networking::unavailable("bind failed");
+        assert_eq!(
+            networking.get().err().as_deref(),
+            Some("Networking unavailable: bind failed")
+        );
+        assert_eq!(networking.error(), Some("bind failed"));
+    }
+
+    #[test]
+    fn handshake_limiter_enforces_per_peer_interval() {
+        let mut limiter = HandshakeLimiter::default();
+        let peer = SecretKey::generate().public();
+        let start = Instant::now();
+
+        let accepted = (0..100)
+            .filter(|i| limiter.allow(peer, start + Duration::from_millis(*i)))
+            .count();
+        assert_eq!(accepted, 1);
+        assert!(limiter.allow(peer, start + HANDSHAKE_PEER_INTERVAL));
+    }
+
+    #[test]
+    fn handshake_limiter_enforces_global_cap() {
+        let mut limiter = HandshakeLimiter::default();
+        let start = Instant::now();
+
+        let accepted = (0..100)
+            .filter(|_| limiter.allow(SecretKey::generate().public(), start))
+            .count();
+        assert_eq!(accepted, HANDSHAKE_GLOBAL_LIMIT);
+        assert!(limiter.allow(
+            SecretKey::generate().public(),
+            start + HANDSHAKE_GLOBAL_WINDOW
+        ));
     }
 
     #[test]
@@ -447,15 +609,18 @@ mod tests {
 
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
             app.handle().once("incoming_signal", move |event| {
-                let payload = serde_json::from_str::<String>(event.payload()).unwrap();
-                let _ = event_tx.send(payload);
+                let signal = serde_json::from_str::<IncomingSignal>(event.payload()).unwrap();
+                let _ = event_tx.send(signal);
             });
 
             let sender = Endpoint::builder(presets::N0).bind().await.unwrap();
+            // The payload claims to come from another node; `from` must still
+            // be the authenticated connection peer.
+            let forged_sender = SecretKey::generate().public().to_string();
             let payload = serde_json::json!({
                 "type": "offer",
                 "sdp": "test-offer",
-                "sender": sender.id().to_string(),
+                "sender": forged_sender,
             })
             .to_string();
             let connection = sender
@@ -468,8 +633,11 @@ mod tests {
 
             let received = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
                 .await
-                .expect("receiver did not emit incoming_signal");
-            assert_eq!(received.as_deref(), Some(payload.as_str()));
+                .expect("receiver did not emit incoming_signal")
+                .expect("event channel closed");
+            assert_eq!(received.payload, payload);
+            assert_eq!(received.from, sender.id().to_string());
+            assert_ne!(received.from, forged_sender);
         })
         .await
         .expect("two-node signaling test timed out");

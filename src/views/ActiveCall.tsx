@@ -21,6 +21,7 @@ import {
   listenForIncomingSignals,
   takeBufferedCandidates,
   clearBufferedCandidates,
+  isFromPeer,
 } from '../services/signaling';
 
 interface ActiveCallProps {
@@ -57,13 +58,16 @@ async function logIcePairs(pc: RTCPeerConnection, label: string): Promise<void> 
       const c = byId.get(String(id));
       return c ? `${c.candidateType}/${c.protocol} ${c.address ?? c.ip}:${c.port}` : '?';
     };
+    let pairCount = 0;
     stats.forEach((s) => {
       if (s.type !== 'candidate-pair') return;
+      pairCount += 1;
       const p = s as Record<string, unknown>;
       console.info(
         `[DEBUG-ice] ${label} pair ${fmt(p.localCandidateId)} -> ${fmt(p.remoteCandidateId)} state=${p.state} nominated=${p.nominated}`
       );
     });
+    if (pairCount === 0) console.info(`[DEBUG-ice] ${label}: no candidate pairs in stats`);
   } catch (err) {
     console.warn('[DEBUG-ice] getStats failed:', err);
   }
@@ -84,7 +88,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   >('initializing');
   const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
-  const [remoteNodeId, setRemoteNodeId] = useState<string>(
+  // The peer is fixed for the call: App always passes `contact`, including for
+  // incoming calls, so there is no "adopt the first sender" fallback.
+  const [remoteNodeId] = useState<string>(
     contact?.iroh_node_id || initialSignal?.sender || ''
   );
 
@@ -219,20 +225,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    listenForIncomingSignals((payloadString) => {
-      try {
-        const signal = JSON.parse(payloadString) as SignalMessage;
-        const currentPeer = remoteNodeIdRef.current;
-        if (
-          signal.type === 'hangup' &&
-          signal.sender &&
-          currentPeer &&
-          signal.sender.toLowerCase() === currentPeer.toLowerCase()
-        ) {
-          cleanupCall();
-        }
-      } catch {
-        // The main signaling listener reports malformed WebRTC payloads.
+    listenForIncomingSignals((signal) => {
+      if (signal.type === 'hangup' && isFromPeer(signal, remoteNodeIdRef.current)) {
+        cleanupCall();
       }
     })
       .then((stopListening) => {
@@ -393,8 +388,17 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
 
         pc.oniceconnectionstatechange = () => {
           console.info('[DEBUG-ice] ICE connection state:', pc.iceConnectionState);
-          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'failed') {
-            void logIcePairs(pc, pc.iceConnectionState);
+          // Failure pairs are logged from onconnectionstatechange.
+          if (pc.iceConnectionState === 'connected') {
+            void logIcePairs(pc, 'connected');
+          } else if (pc.iceConnectionState === 'checking') {
+            // Chromium can drop failed pairs before reporting failure, so take
+            // a snapshot while checks are still running.
+            setTimeout(() => {
+              if (pcRef.current === pc && pc.iceConnectionState === 'checking') {
+                void logIcePairs(pc, 'still-checking');
+              }
+            }, 10000);
           }
         };
         pc.onicegatheringstatechange = () => {
@@ -419,7 +423,14 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
                 cleanupCall();
               }
             }, 4000);
-          } else if (state === 'failed' || state === 'closed') {
+          } else if (state === 'failed') {
+            setConnectionStatus('failed');
+            // ICE can go checking -> disconnected without ever reporting
+            // 'failed', so log the tried pairs here, before cleanup closes pc.
+            void logIcePairs(pc, 'failed').finally(cleanupCall);
+            // Tell the peer, or it waits on "connecting" indefinitely.
+            void sendHangup(hasConnectedRef.current ? 'ended' : 'cancelled');
+          } else if (state === 'closed') {
             setConnectionStatus('failed');
             cleanupCall();
           }
@@ -443,11 +454,6 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         const handleSignalMessage = async (signal: SignalMessage) => {
           if (isCallEndedRef.current || !pcRef.current) return;
           const currentPc = pcRef.current;
-
-          if (signal.sender && !remoteNodeIdRef.current) {
-            remoteNodeIdRef.current = signal.sender;
-            setRemoteNodeId(signal.sender);
-          }
 
           try {
             if (signal.type === 'offer' && signal.sdp) {
@@ -494,16 +500,15 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         };
 
         // 7. Subscribe to Tauri incoming_signal events
-        unlistenSignals = await listenForIncomingSignals((payloadString: string) => {
-          try {
-            const parsed = JSON.parse(payloadString) as SignalMessage;
-            if (parsed.type === 'hangup') return;
-            if (parsed.type) {
-              handleSignalMessage(parsed);
-            }
-          } catch (e) {
-            console.warn('[WebRTC] Received non-JSON signal payload:', payloadString, e);
+        unlistenSignals = await listenForIncomingSignals((signal) => {
+          if (signal.type === 'hangup') return;
+          if (!isFromPeer(signal, remoteNodeIdRef.current)) {
+            console.warn(
+              `[WebRTC] Dropping ${signal.type} from ${signal.sender ?? 'unknown'}: not the current peer`
+            );
+            return;
           }
+          void handleSignalMessage(signal);
         });
         if (isStaleInitialization()) {
           // Unmounted while listen() was pending; the effect cleanup already ran.
@@ -558,7 +563,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         unlistenSignals();
       }
     };
-  }, [isIncoming, initialSignal, cleanup, cleanupCall, clearDisconnectTimeout]);
+  }, [isIncoming, initialSignal, cleanup, cleanupCall, clearDisconnectTimeout, sendHangup]);
 
   // Toggle Microphone
   const toggleMute = () => {
@@ -719,8 +724,10 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
 
       {/* Main Video Stage */}
       <main className="relative flex-1 flex items-center justify-center p-4">
-        {/* Remote Video Container */}
-        <div className="relative w-full h-full rounded-3xl bg-zinc-900 border border-zinc-800/80 overflow-hidden flex flex-col items-center justify-center shadow-2xl">
+        {/* Remote Video Container. Absolutely positioned because Android's
+            Chromium webview does not treat h-full as a definite height here,
+            so the box collapsed to zero once the placeholder was removed. */}
+        <div className="absolute inset-4 rounded-3xl bg-zinc-900 border border-zinc-800/80 overflow-hidden flex flex-col items-center justify-center shadow-2xl">
           {/* Remote Video Stream Element */}
           <video
             ref={remoteVideoRef}

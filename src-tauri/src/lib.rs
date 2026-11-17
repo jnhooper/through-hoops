@@ -19,23 +19,13 @@ pub fn run() {
         Migration {
             version: 1,
             description: "create_contacts_table",
-            sql: "CREATE TABLE IF NOT EXISTS contacts (
-                iroh_node_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                photo_path TEXT,
-                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_called_at DATETIME
-            );",
+            sql: db::CREATE_CONTACTS_TABLE,
             kind: MigrationKind::Up,
         },
         Migration {
             version: 2,
             description: "create_local_profile_table",
-            sql: "CREATE TABLE IF NOT EXISTS local_profile (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                name TEXT NOT NULL,
-                photo_path TEXT
-            );",
+            sql: db::CREATE_LOCAL_PROFILE_TABLE,
             kind: MigrationKind::Up,
         },
     ];
@@ -58,20 +48,40 @@ pub fn run() {
         // Setup persistent Iroh node and store in managed state
         .setup(|app| {
             let app_handle = app.handle().clone();
-            tauri::async_runtime::block_on(async move {
-                let signaling_state = signaling::init_node(app_handle)
-                    .await
-                    .expect("failed to initialize persistent Iroh signaling node");
-                app.manage(signaling_state);
+            let cleanup_handle = app.handle().clone();
+
+            // Rust owns one pool, created (with tables) before networking starts,
+            // so an inbound handshake can save a contact before JS loads the DB.
+            let db_path = db::get_db_path(app.handle())?;
+            let pool = tauri::async_runtime::block_on(db::open_pool(&db_path))?;
+            app.manage(db::Db(pool.clone()));
+
+            // A failed node start must not crash the app: keep running with
+            // signaling marked unavailable, and let Home show a banner.
+            let networking = match tauri::async_runtime::block_on(signaling::init_node(app_handle))
+            {
+                Ok(state) => signaling::Networking::ready(state),
+                Err(err) => {
+                    log::error!("Failed to start networking: {err:#}");
+                    signaling::Networking::unavailable(format!("{err:#}"))
+                }
+            };
+            app.manage(networking);
+            // Best-effort; runs after the schema above exists.
+            tauri::async_runtime::spawn(async move {
+                db::cleanup_orphan_avatars(&cleanup_handle, &pool).await;
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             signaling::get_my_node_id,
+            signaling::networking_error,
             signaling::send_signal,
             signaling::perform_handshake,
             db::get_local_profile,
             db::save_local_profile,
+            db::remove_contact,
+            avatar::import_local_avatar,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

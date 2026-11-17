@@ -65,11 +65,8 @@ export const AddContactModal: React.FC<AddContactModalProps> = ({
     } catch (err: unknown) {
       console.error('Failed to add contact:', err);
       const message = err instanceof Error ? err.message : String(err);
-      if (message.includes('UNIQUE constraint failed') || message.includes('already exists')) {
-        setError('A contact with this Iroh Node ID is already saved.');
-      } else {
-        setError(message || 'Failed to add contact. Please check your inputs.');
-      }
+      // insertContact is an upsert, so adding an existing contact just updates it.
+      setError(message || 'Failed to add contact. Please check your inputs.');
     } finally {
       setIsSubmitting(false);
     }

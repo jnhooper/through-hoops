@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Video, Copy, Check, Clock, Trash2, Calendar } from 'lucide-react';
 import type { Contact } from '../types/contact';
 import { resolveAvatarUrl } from '../services/db';
+import { parseDbTimestamp } from '../utils/time';
 
 interface ContactCardProps {
   contact: Contact;
@@ -36,7 +37,7 @@ function getInitials(name: string): string {
 
 function formatRelativeTime(dateString?: string | null): string {
   if (!dateString) return '';
-  const date = new Date(dateString);
+  const date = parseDbTimestamp(dateString);
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
 

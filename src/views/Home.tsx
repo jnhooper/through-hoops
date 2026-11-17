@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
   Clock,
@@ -24,6 +24,8 @@ import {
   isTauriEnvironment,
 } from '../services/db';
 import { ContactCard } from '../components/ContactCard';
+import { parseDbTimestamp } from '../utils/time';
+import { getNetworkingError } from '../services/signaling';
 import { AddContactModal } from '../components/AddContactModal';
 import { MyCodeModal } from '../components/MyCodeModal';
 import { ProfileModal } from '../components/ProfileModal';
@@ -44,45 +46,50 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
     photo_path: null,
   });
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [networkingError, setNetworkingError] = useState<string | null>(null);
 
-  // Load contacts from SQLite via @tauri-apps/plugin-sql
+  // Every load (initial, manual refresh, contacts_changed) goes through here.
+  // Overlapping loads can finish out of order, so only the latest request may
+  // update state; older results are dropped, including their errors and their
+  // loading-flag reset.
+  const latestContactsRequest = useRef(0);
   const fetchContacts = useCallback(async () => {
+    const requestId = ++latestContactsRequest.current;
+    const isLatest = () => requestId === latestContactsRequest.current;
     try {
       setIsLoading(true);
       const data = await loadContactsFromDb();
-      setContacts(data);
+      if (isLatest()) setContacts(data);
     } catch (err) {
-      console.error('Failed to load contacts:', err);
-      setStatusMessage('Unable to access contacts database.');
+      if (isLatest()) {
+        console.error('Failed to load contacts:', err);
+        setStatusMessage('Unable to access contacts database.');
+      }
     } finally {
-      setIsLoading(false);
+      if (isLatest()) setIsLoading(false);
     }
   }, []);
 
+  // Initial load. Same stale-result rule as fetchContacts (shared counter), but
+  // inline because isLoading already starts true.
   useEffect(() => {
-    let ignore = false;
+    const requestId = ++latestContactsRequest.current;
+    const isLatest = () => requestId === latestContactsRequest.current;
     async function init() {
       try {
         const data = await loadContactsFromDb();
-        if (!ignore) {
-          setContacts(data);
-        }
+        if (isLatest()) setContacts(data);
       } catch (err) {
-        if (!ignore) {
+        if (isLatest()) {
           console.error('Failed to load contacts:', err);
           setStatusMessage('Unable to access contacts database.');
         }
       } finally {
-        if (!ignore) {
-          setIsLoading(false);
-        }
+        if (isLatest()) setIsLoading(false);
       }
     }
 
-    init();
-    return () => {
-      ignore = true;
-    };
+    void init();
   }, []);
 
   useEffect(() => {
@@ -115,6 +122,21 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
       })
       .catch((err: unknown) => {
         console.error('Failed to load local profile:', err);
+        if (!ignore) setStatusMessage(`Unable to load your profile: ${String(err)}`);
+      });
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    getNetworkingError()
+      .then((reason) => {
+        if (!ignore) setNetworkingError(reason);
+      })
+      .catch((err: unknown) => {
+        console.error('Failed to check networking status:', err);
       });
     return () => {
       ignore = true;
@@ -159,13 +181,14 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
   // 2. Alphabetical: The rest, strictly ensuring no duplicates from Recents
   const { recents, alphabetical } = useMemo(() => {
     // Contacts with last_called_at set, sorted newest first
-    const calledContacts = [...filteredContacts]
-      .filter((c) => c.last_called_at != null && c.last_called_at !== '')
-      .sort((a, b) => {
-        const timeA = new Date(a.last_called_at!).getTime();
-        const timeB = new Date(b.last_called_at!).getTime();
-        return timeB - timeA;
-      });
+    const calledContacts = filteredContacts
+      .flatMap((contact) =>
+        contact.last_called_at
+          ? [{ contact, time: parseDbTimestamp(contact.last_called_at).getTime() }]
+          : []
+      )
+      .sort((a, b) => b.time - a.time)
+      .map(({ contact }) => contact);
 
     // Top 3 recents
     const topRecents = calledContacts.slice(0, 3);
@@ -268,6 +291,16 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
             className="w-full rounded-2xl bg-zinc-900/80 border border-zinc-800/80 pl-10 pr-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/80 transition-all shadow-inner"
           />
         </div>
+
+        {networkingError && (
+          <div
+            role="alert"
+            className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm"
+          >
+            {networkingError}. You can browse contacts, but calls and adding contacts won&apos;t
+            work until the app is restarted.
+          </div>
+        )}
 
         {statusMessage && (
           <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm">
