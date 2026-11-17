@@ -129,9 +129,20 @@ pub async fn save_local_profile(
         }
         None => None,
     };
-    upsert_local_profile(&db.0, &name, photo_path.as_deref())
+    let saved = upsert_local_profile(&db.0, &name, photo_path.as_deref())
         .await
-        .map_err(|e| format!("Failed to save local profile: {e}"))
+        .map_err(|e| format!("Failed to save local profile: {e}"))?;
+
+    // Each pick imports a new profile-<uuid> file; drop the ones no longer used.
+    if let Ok(dir) = avatars::avatars_dir(&app) {
+        let keep = saved
+            .photo_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().to_string());
+        avatars::remove_stale_profile_avatars(&dir, keep.as_deref()).await;
+    }
+    Ok(saved)
 }
 
 /// Canonical node ID for filenames: the parsed EndpointId's string form when the

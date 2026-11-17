@@ -11,8 +11,6 @@
     "sql:allow-execute",
     "sql:allow-select",
     "dialog:default",
-    "fs:default",
-    "fs:allow-copy-file",
-    "fs:allow-appdata-write-recursive"
+    "fs:default"
   ]
 }

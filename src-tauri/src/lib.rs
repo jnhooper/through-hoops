@@ -75,6 +75,7 @@ pub fn run() {
             db::get_local_profile,
             db::save_local_profile,
             db::remove_contact,
+            avatar::import_local_avatar,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

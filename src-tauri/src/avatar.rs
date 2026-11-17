@@ -15,15 +15,7 @@ pub struct AvatarPayload {
 
 impl AvatarPayload {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_AVATAR_BYTES {
-            return Err(format!(
-                "Avatar exceeds the {} MiB size limit",
-                MAX_AVATAR_BYTES / 1024 / 1024
-            ));
-        }
-
-        let (mime_type, _) = detect_image_type(bytes)
-            .ok_or_else(|| "Avatar must be a PNG, JPEG, GIF, or WebP image".to_string())?;
+        let (mime_type, _) = check_avatar_bytes(bytes)?;
 
         Ok(Self {
             data: STANDARD.encode(bytes),
@@ -52,6 +44,19 @@ impl AvatarPayload {
 
         Ok((bytes, extension))
     }
+}
+
+/// Validates local avatar bytes by size and content (never by file name),
+/// returning the detected MIME type and the extension to save it under.
+fn check_avatar_bytes(bytes: &[u8]) -> Result<(&'static str, &'static str), String> {
+    if bytes.len() > MAX_AVATAR_BYTES {
+        return Err(format!(
+            "Avatar exceeds the {} MiB size limit",
+            MAX_AVATAR_BYTES / 1024 / 1024
+        ));
+    }
+    detect_image_type(bytes)
+        .ok_or_else(|| "Avatar must be a PNG, JPEG, GIF, or WebP image".to_string())
 }
 
 fn detect_image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
@@ -151,6 +156,32 @@ pub fn avatars_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, Str
         .map_err(|err| format!("Unable to resolve avatar directory: {err}"))
 }
 
+/// Writes `dir/file_name` via a temp file in the same directory and a rename,
+/// so readers never see a partial image. The temp name keeps `file_name` as a
+/// prefix, so the startup sweeps remove leftovers from a crash mid-write.
+async fn write_file_atomic(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|err| format!("Unable to create avatar directory {}: {err}", dir.display()))?;
+    let final_path = dir.join(file_name);
+    let tmp_path = dir.join(format!("{file_name}.tmp-{}", Uuid::new_v4()));
+    if let Err(err) = tokio::fs::write(&tmp_path, bytes).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(format!(
+            "Unable to write avatar {}: {err}",
+            tmp_path.display()
+        ));
+    }
+    if let Err(err) = tokio::fs::rename(&tmp_path, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(format!(
+            "Unable to move avatar into place at {}: {err}",
+            final_path.display()
+        ));
+    }
+    Ok(final_path)
+}
+
 /// Node IDs become part of a filename, so only accept plain alphanumerics.
 fn is_safe_file_stem(node_id: &str) -> bool {
     !node_id.is_empty()
@@ -172,32 +203,12 @@ pub async fn write_contact_avatar(
             "Refusing to build an avatar filename from node ID {node_id:?}"
         ));
     }
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|err| format!("Unable to create avatar directory {}: {err}", dir.display()))?;
-
-    let final_path = dir.join(format!("{CONTACT_AVATAR_PREFIX}{node_id}.{extension}"));
-    // The temp name keeps the contact- prefix so a crash mid-write leaves a file
-    // that the startup orphan sweep removes.
-    let tmp_path = dir.join(format!(
-        "{CONTACT_AVATAR_PREFIX}{node_id}.{extension}.tmp-{}",
-        Uuid::new_v4()
-    ));
-    if let Err(err) = tokio::fs::write(&tmp_path, bytes).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(format!(
-            "Unable to write avatar {}: {err}",
-            tmp_path.display()
-        ));
-    }
-    if let Err(err) = tokio::fs::rename(&tmp_path, &final_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(format!(
-            "Unable to move avatar into place at {}: {err}",
-            final_path.display()
-        ));
-    }
-
+    let final_path = write_file_atomic(
+        dir,
+        &format!("{CONTACT_AVATAR_PREFIX}{node_id}.{extension}"),
+        bytes,
+    )
+    .await?;
     remove_contact_avatar_files(dir, node_id, Some(extension)).await;
     Ok(final_path)
 }
@@ -218,6 +229,85 @@ pub async fn remove_contact_avatar_files(dir: &Path, node_id: &str, keep: Option
             Err(err) => log::warn!("Unable to remove avatar {}: {err}", path.display()),
         }
     }
+}
+
+const PROFILE_AVATAR_PREFIX: &str = "profile-";
+/// Written by the old JS picker (`avatar-<timestamp>.<ext>`).
+const LEGACY_PROFILE_AVATAR_PREFIX: &str = "avatar-";
+
+/// Validates `bytes` as an image and stores it as `profile-<uuid>.<ext>`. Each
+/// import gets a new name so a webview never shows a cached older picture, and
+/// the saved avatar stays intact if the user cancels the profile dialog.
+pub async fn store_profile_avatar(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let (_, extension) = check_avatar_bytes(bytes)?;
+    write_file_atomic(
+        dir,
+        &format!("{PROFILE_AVATAR_PREFIX}{}.{extension}", Uuid::new_v4()),
+        bytes,
+    )
+    .await
+}
+
+/// Deletes profile avatars (current and legacy naming) other than `keep`, a
+/// file name. Called after the profile is saved.
+pub async fn remove_stale_profile_avatars(dir: &Path, keep: Option<&str>) {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("Unable to list avatar directory {}: {err}", dir.display());
+            }
+            return;
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_profile = name.starts_with(PROFILE_AVATAR_PREFIX)
+            || name.starts_with(LEGACY_PROFILE_AVATAR_PREFIX);
+        if !is_profile || Some(name.as_str()) == keep {
+            continue;
+        }
+        if let Err(err) = tokio::fs::remove_file(entry.path()).await {
+            log::warn!("Unable to remove old profile avatar {name}: {err}");
+        }
+    }
+}
+
+/// Imports the avatar picked in the file dialog. `source` may be a filesystem
+/// path or, on Android, a `content://` URI, which only tauri-plugin-fs can open.
+/// The file is validated by its bytes, since content URIs have no extension.
+#[tauri::command]
+pub async fn import_local_avatar(source: String, app: AppHandle) -> Result<String, String> {
+    use std::io::Read;
+    use std::str::FromStr;
+    use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
+
+    let file_path = match FilePath::from_str(&source) {
+        Ok(path) => path,
+        Err(never) => match never {},
+    };
+    let reader_app = app.clone();
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let file = reader_app
+            .fs()
+            .open(file_path, options)
+            .map_err(|err| format!("Unable to open the selected image: {err}"))?;
+        // Read one byte past the cap so oversized files are detected without
+        // loading them whole.
+        let mut bytes = Vec::new();
+        file.take(MAX_AVATAR_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("Unable to read the selected image: {err}"))?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|err| format!("Avatar import failed: {err}"))??;
+
+    let dir = avatars_dir(&app)?;
+    let path = store_profile_avatar(&dir, &bytes).await?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// Saves an inbound avatar as `avatars/contact-<node_id>.<ext>` and returns the
@@ -418,6 +508,44 @@ mod tests {
         );
         assert!(ensure_within_dir(&dir.join("../"), &dir).await.is_err());
         assert!(ensure_within_dir(&dir, &dir).await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_import_validates_content_not_name() {
+        let dir = scratch_dir();
+
+        let renamed_text = b"definitely not an image";
+        assert!(store_profile_avatar(&dir, renamed_text).await.is_err());
+
+        let saved = store_profile_avatar(&dir, PNG_HEADER).await.unwrap();
+        let name = saved.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("profile-") && name.ends_with(".png"));
+
+        let oversized = [PNG_HEADER, &vec![0; MAX_AVATAR_BYTES]].concat();
+        assert!(store_profile_avatar(&dir, &oversized).await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_profile_avatars_are_removed_after_save() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "profile-old.png",
+            "profile-new.jpg",
+            "avatar-123.png",
+            "contact-x.png",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        remove_stale_profile_avatars(&dir, Some("profile-new.jpg")).await;
+
+        assert_eq!(
+            file_names(&dir),
+            vec!["contact-x.png".to_string(), "profile-new.jpg".to_string()]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

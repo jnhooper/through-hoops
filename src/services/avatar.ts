@@ -1,12 +1,14 @@
-import { appDataDir, join } from '@tauri-apps/api/path';
+import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { BaseDirectory, copyFile, mkdir } from '@tauri-apps/plugin-fs';
 
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
 
 /**
  * Prompts for an image and stores a private copy in the app's data directory.
  * Returns the absolute path to persist in the local profile, or null on cancel.
+ *
+ * Rust reads and validates the file by its contents: on Android the dialog
+ * returns a `content://` URI with no file extension to check.
  */
 export async function pickAndCopyAvatar(): Promise<string | null> {
   const selected = await open({
@@ -17,21 +19,5 @@ export async function pickAndCopyAvatar(): Promise<string | null> {
 
   if (!selected) return null;
 
-  const extension = selected.split('.').pop()?.toLowerCase();
-  if (!extension || !IMAGE_EXTENSIONS.includes(extension)) {
-    throw new Error('Please choose a PNG, JPEG, GIF, or WebP image.');
-  }
-
-  const fileName = `avatar-${Date.now()}.${extension}`;
-  const relativePath = `avatars/${fileName}`;
-
-  await mkdir('avatars', {
-    baseDir: BaseDirectory.AppData,
-    recursive: true,
-  });
-  await copyFile(selected, relativePath, {
-    toPathBaseDir: BaseDirectory.AppData,
-  });
-
-  return join(await appDataDir(), relativePath);
+  return await invoke<string>('import_local_avatar', { source: selected });
 }
