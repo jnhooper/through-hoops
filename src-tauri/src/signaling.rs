@@ -134,6 +134,10 @@ async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &Han
     }
 }
 
+// Unidirectional-stream signaling. `send_signal` sends over bidirectional
+// streams, so nothing in this app opens a uni stream today; the receive path is
+// kept for compatibility with peers or builds that signal over uni streams, and
+// because it is harmless. It is exercised only by the tests below.
 async fn forward_uni_signal<R: tauri::Runtime>(
     app: AppHandle<R>,
     peer: String,
