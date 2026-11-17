@@ -448,3 +448,32 @@ _(implementing agent: append here)_
   connect over the LAN once the permission is granted. (d) and (e) connect over
   cellular, but (d) failed once out of three runs, which fits the known
   carrier-NAT limitation.
+
+### Phases 1–2
+
+- **Status (1.1–2.4 done).** Everything below needs device testing that
+  hasn't been done yet:
+  - **1.4 CSP:** a full call on a macOS build and on an Android build, watching
+    for `[CSP]` console warnings. `src/main.tsx` now logs every violation.
+  - **2.1:** an inbound handshake on a fresh install, before the UI loads.
+  - **2.4:** picking an avatar from the Android photo picker.
+- **The CSP never applies in dev.** Tauri adds it only to assets served
+  through its own protocol. Desktop `tauri dev` loads the Vite URL directly,
+  and the mobile dev proxy adds no CSP header (`tauri` 2.12.5,
+  `protocol/tauri.rs`). It can only be verified in built apps, and no
+  `devCsp` is needed.
+- **The 2.4 profile avatar filename differs from the plan.** It's
+  `profile-<uuid>.<ext>`, not `profile.<ext>`. A fixed name keeps the same
+  asset URL, so the webview shows the cached picture, and it would overwrite
+  the saved avatar before the user presses Save. Stale profile files are
+  deleted after a successful save.
+- **Contact avatars can show a cached image.** `contact-<node_id>.<ext>`
+  keeps the same URL when a contact changes their picture, so the webview may
+  show the old one until the app restarts. This is minor and not fixed.
+- **Unused dependency.** `@tauri-apps/plugin-fs` in `package.json` is no longer
+  imported by JS. The Rust crate is still needed for `import_local_avatar`.
+- **Busy reply.** 1.2 replies `busy` only while an incoming call is pending.
+  During an active call, a second caller's ring is still ignored silently, as
+  before, so that caller waits until their own call times out.
+- **Formatting.** `cargo fmt --check` fails on code that was already there,
+  such as `build.rs`. Only the files changed in this branch were formatted.
