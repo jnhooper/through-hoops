@@ -181,13 +181,14 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
   // 2. Alphabetical: The rest, strictly ensuring no duplicates from Recents
   const { recents, alphabetical } = useMemo(() => {
     // Contacts with last_called_at set, sorted newest first
-    const calledContacts = [...filteredContacts]
-      .filter((c) => c.last_called_at != null && c.last_called_at !== '')
-      .sort((a, b) => {
-        const timeA = parseDbTimestamp(a.last_called_at!).getTime();
-        const timeB = parseDbTimestamp(b.last_called_at!).getTime();
-        return timeB - timeA;
-      });
+    const calledContacts = filteredContacts
+      .flatMap((contact) =>
+        contact.last_called_at
+          ? [{ contact, time: parseDbTimestamp(contact.last_called_at).getTime() }]
+          : []
+      )
+      .sort((a, b) => b.time - a.time)
+      .map(({ contact }) => contact);
 
     // Top 3 recents
     const topRecents = calledContacts.slice(0, 3);

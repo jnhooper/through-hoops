@@ -8,7 +8,10 @@ document.addEventListener('securitypolicyviolation', (e) => {
   console.warn(`[CSP] blocked ${e.blockedURI || '(inline)'} by ${e.violatedDirective}`)
 })
 
-createRoot(document.getElementById('root')!).render(
+const rootElement = document.getElementById('root')
+if (!rootElement) throw new Error('index.html is missing the #root element')
+
+createRoot(rootElement).render(
   <StrictMode>
     <App />
   </StrictMode>,
