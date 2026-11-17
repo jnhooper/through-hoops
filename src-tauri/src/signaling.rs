@@ -96,7 +96,7 @@ fn normalized_name(name: &str) -> String {
 }
 
 async fn local_handshake(app: &AppHandle, node_id: String) -> Result<HandshakePayload, String> {
-    let profile = db::query_local_profile(app)
+    let profile = db::query_local_profile(&app.state::<db::Db>().0)
         .await
         .map_err(|err| format!("Failed to read local profile: {err}"))?;
     let photo = load_local_avatar(app, profile.photo_path.as_deref()).await;
@@ -116,7 +116,8 @@ async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &Han
     let photo_path = save_received_avatar(app, remote_id, handshake.photo.as_ref()).await;
     let name = normalized_name(&handshake.name);
 
-    match db::upsert_contact(app, remote_id, &name, photo_path.as_deref()).await {
+    let pool = app.state::<db::Db>().0.clone();
+    match db::upsert_contact(&pool, remote_id, &name, photo_path.as_deref()).await {
         Ok(()) => {
             log::info!("Added or updated contact for peer {remote_id}");
             if let Err(err) = app.emit("contacts_changed", ()) {

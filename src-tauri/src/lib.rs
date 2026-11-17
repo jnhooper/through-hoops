@@ -19,23 +19,13 @@ pub fn run() {
         Migration {
             version: 1,
             description: "create_contacts_table",
-            sql: "CREATE TABLE IF NOT EXISTS contacts (
-                iroh_node_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                photo_path TEXT,
-                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_called_at DATETIME
-            );",
+            sql: db::CREATE_CONTACTS_TABLE,
             kind: MigrationKind::Up,
         },
         Migration {
             version: 2,
             description: "create_local_profile_table",
-            sql: "CREATE TABLE IF NOT EXISTS local_profile (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                name TEXT NOT NULL,
-                photo_path TEXT
-            );",
+            sql: db::CREATE_LOCAL_PROFILE_TABLE,
             kind: MigrationKind::Up,
         },
     ];
@@ -59,15 +49,22 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             let cleanup_handle = app.handle().clone();
+
+            // Rust owns one pool, created (with tables) before networking starts,
+            // so an inbound handshake can save a contact before JS loads the DB.
+            let db_path = db::get_db_path(app.handle())?;
+            let pool = tauri::async_runtime::block_on(db::open_pool(&db_path))?;
+            app.manage(db::Db(pool.clone()));
+
             tauri::async_runtime::block_on(async move {
                 let signaling_state = signaling::init_node(app_handle)
                     .await
                     .expect("failed to initialize persistent Iroh signaling node");
                 app.manage(signaling_state);
             });
-            // Best-effort; skips itself if the contacts table can't be read yet.
+            // Best-effort; runs after the schema above exists.
             tauri::async_runtime::spawn(async move {
-                db::cleanup_orphan_avatars(&cleanup_handle).await;
+                db::cleanup_orphan_avatars(&cleanup_handle, &pool).await;
             });
             Ok(())
         })
