@@ -24,6 +24,7 @@ import {
   isTauriEnvironment,
 } from '../services/db';
 import { ContactCard } from '../components/ContactCard';
+import { parseDbTimestamp } from '../utils/time';
 import { AddContactModal } from '../components/AddContactModal';
 import { MyCodeModal } from '../components/MyCodeModal';
 import { ProfileModal } from '../components/ProfileModal';
@@ -163,8 +164,8 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
     const calledContacts = [...filteredContacts]
       .filter((c) => c.last_called_at != null && c.last_called_at !== '')
       .sort((a, b) => {
-        const timeA = new Date(a.last_called_at!).getTime();
-        const timeB = new Date(b.last_called_at!).getTime();
+        const timeA = parseDbTimestamp(a.last_called_at!).getTime();
+        const timeB = parseDbTimestamp(b.last_called_at!).getTime();
         return timeB - timeA;
       });
 
