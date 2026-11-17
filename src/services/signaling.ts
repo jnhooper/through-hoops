@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { isTauriEnvironment } from './db';
+import type { SignalMessage } from '../types/signaling';
 
 const MOCK_LOCAL_NODE_ID = 'local-node-8fa93c20b81e47d9023fbc8102a9';
 
@@ -67,18 +68,51 @@ export async function sendSignal(remoteId: string, payload: string): Promise<voi
   }
 }
 
+/** Envelope emitted by Rust: `from` is the iroh-authenticated peer ID. */
+export interface IncomingSignalEnvelope {
+  from: string;
+  payload: string;
+}
+
+/**
+ * Parses an incoming envelope into a SignalMessage whose `sender` is the
+ * authenticated peer ID. Any self-declared `sender` in the payload is
+ * overwritten. Returns null for payloads that are not JSON objects with a type.
+ */
+export function parseIncomingSignal(envelope: IncomingSignalEnvelope): SignalMessage | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(envelope.payload);
+  } catch {
+    console.debug('[signaling] Dropping non-JSON signal from', envelope.from);
+    return null;
+  }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as { type?: unknown }).type !== 'string'
+  ) {
+    console.debug('[signaling] Dropping signal without a type from', envelope.from);
+    return null;
+  }
+  return { ...(parsed as SignalMessage), sender: envelope.from };
+}
+
 /**
  * Listens for incoming Iroh signaling messages emitted by the Rust backend.
+ * The callback receives only well-formed signals, with `sender` set to the
+ * authenticated peer ID.
  */
 export async function listenForIncomingSignals(
-  callback: (payload: string) => void
+  callback: (signal: SignalMessage) => void
 ): Promise<UnlistenFn> {
   if (!isTauriEnvironment()) {
     console.info('Browser preview: registered mock incoming_signal listener.');
     return () => {};
   }
 
-  return await listen<string>('incoming_signal', (event) => {
-    callback(event.payload);
+  return await listen<IncomingSignalEnvelope>('incoming_signal', (event) => {
+    const signal = parseIncomingSignal(event.payload);
+    if (signal) callback(signal);
   });
 }

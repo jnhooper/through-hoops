@@ -222,20 +222,15 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    listenForIncomingSignals((payloadString) => {
-      try {
-        const signal = JSON.parse(payloadString) as SignalMessage;
-        const currentPeer = remoteNodeIdRef.current;
-        if (
-          signal.type === 'hangup' &&
-          signal.sender &&
-          currentPeer &&
-          signal.sender.toLowerCase() === currentPeer.toLowerCase()
-        ) {
-          cleanupCall();
-        }
-      } catch {
-        // The main signaling listener reports malformed WebRTC payloads.
+    listenForIncomingSignals((signal) => {
+      const currentPeer = remoteNodeIdRef.current;
+      if (
+        signal.type === 'hangup' &&
+        signal.sender &&
+        currentPeer &&
+        signal.sender.toLowerCase() === currentPeer.toLowerCase()
+      ) {
+        cleanupCall();
       }
     })
       .then((stopListening) => {
@@ -513,16 +508,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         };
 
         // 7. Subscribe to Tauri incoming_signal events
-        unlistenSignals = await listenForIncomingSignals((payloadString: string) => {
-          try {
-            const parsed = JSON.parse(payloadString) as SignalMessage;
-            if (parsed.type === 'hangup') return;
-            if (parsed.type) {
-              handleSignalMessage(parsed);
-            }
-          } catch (e) {
-            console.warn('[WebRTC] Received non-JSON signal payload:', payloadString, e);
-          }
+        unlistenSignals = await listenForIncomingSignals((signal) => {
+          if (signal.type === 'hangup') return;
+          void handleSignalMessage(signal);
         });
         if (isStaleInitialization()) {
           // Unmounted while listen() was pending; the effect cleanup already ran.

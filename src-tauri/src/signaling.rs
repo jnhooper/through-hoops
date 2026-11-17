@@ -34,6 +34,15 @@ pub struct HandshakeResult {
     pub remote_photo_path: Option<String>,
 }
 
+/// Envelope for `incoming_signal` events. `from` is the peer ID authenticated by
+/// the iroh connection; the frontend must route on it and ignore any `sender`
+/// field inside `payload`, which the remote peer controls.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IncomingSignal {
+    pub from: String,
+    pub payload: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct SignalingProtocolHandler {
     app_handle: AppHandle,
@@ -88,7 +97,11 @@ async fn forward_uni_signal<R: tauri::Runtime>(
         Ok(bytes) => {
             let payload = String::from_utf8_lossy(&bytes).to_string();
             log::info!("Received signal ({} bytes) from {peer}", payload.len());
-            if let Err(err) = app.emit("incoming_signal", &payload) {
+            let signal = IncomingSignal {
+                from: peer,
+                payload,
+            };
+            if let Err(err) = app.emit("incoming_signal", &signal) {
                 log::error!("Failed to emit incoming_signal event: {err}");
             }
         }
@@ -146,8 +159,11 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                         return;
                                     }
 
-                                    let payload = String::from_utf8_lossy(&bytes).to_string();
-                                    if let Err(err) = app_inner.emit("incoming_signal", &payload) {
+                                    let signal = IncomingSignal {
+                                        from: peer,
+                                        payload: String::from_utf8_lossy(&bytes).to_string(),
+                                    };
+                                    if let Err(err) = app_inner.emit("incoming_signal", &signal) {
                                         log::error!("Failed to emit incoming_signal event: {err}");
                                     }
                                     let _ = send.finish();
@@ -414,7 +430,8 @@ mod tests {
             let app = self.app.clone();
             tokio::spawn(async move {
                 if let Ok(recv) = connection.accept_uni().await {
-                    forward_uni_signal(app, "test-peer".to_string(), recv).await;
+                    let peer = connection.remote_id().to_string();
+                    forward_uni_signal(app, peer, recv).await;
                 }
             });
             Ok(())
@@ -447,15 +464,18 @@ mod tests {
 
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
             app.handle().once("incoming_signal", move |event| {
-                let payload = serde_json::from_str::<String>(event.payload()).unwrap();
-                let _ = event_tx.send(payload);
+                let signal = serde_json::from_str::<IncomingSignal>(event.payload()).unwrap();
+                let _ = event_tx.send(signal);
             });
 
             let sender = Endpoint::builder(presets::N0).bind().await.unwrap();
+            // The payload claims to come from another node; `from` must still
+            // be the authenticated connection peer.
+            let forged_sender = SecretKey::generate().public().to_string();
             let payload = serde_json::json!({
                 "type": "offer",
                 "sdp": "test-offer",
-                "sender": sender.id().to_string(),
+                "sender": forged_sender,
             })
             .to_string();
             let connection = sender
@@ -468,8 +488,11 @@ mod tests {
 
             let received = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
                 .await
-                .expect("receiver did not emit incoming_signal");
-            assert_eq!(received.as_deref(), Some(payload.as_str()));
+                .expect("receiver did not emit incoming_signal")
+                .expect("event channel closed");
+            assert_eq!(received.payload, payload);
+            assert_eq!(received.from, sender.id().to_string());
+            assert_ne!(received.from, forged_sender);
         })
         .await
         .expect("two-node signaling test timed out");

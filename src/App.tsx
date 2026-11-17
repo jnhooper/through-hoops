@@ -33,9 +33,9 @@ export default function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    listenForIncomingSignals(async (payloadString: string) => {
+    // `signal.sender` is the authenticated peer ID (see listenForIncomingSignals).
+    listenForIncomingSignals(async (signal: SignalMessage) => {
       try {
-        const signal = JSON.parse(payloadString) as SignalMessage;
         if (signal.type === 'candidate') {
           // Always buffer, even mid-call: ActiveCall dedupes, and this covers
           // the gap before its own listener is registered.
@@ -87,7 +87,7 @@ export default function App() {
           }));
         }
       } catch (e) {
-        console.warn('Non-JSON incoming signal in App:', payloadString, e);
+        console.warn('Failed to handle incoming signal in App:', e);
       }
     }).then((cleanup) => {
       // If the effect was torn down before listen() resolved (StrictMode, or a
