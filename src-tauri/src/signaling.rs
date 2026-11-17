@@ -7,9 +7,10 @@ use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_mdns_peer_lookup::Options as MdnsOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 
@@ -43,10 +44,46 @@ pub struct IncomingSignal {
     pub payload: String,
 }
 
+const HANDSHAKE_PEER_INTERVAL: Duration = Duration::from_secs(10);
+const HANDSHAKE_GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+const HANDSHAKE_GLOBAL_LIMIT: usize = 30;
+
+/// Limits how often inbound handshakes may write contacts and avatars: at most
+/// one per peer per 10 s, and 30 in total per minute. Rejected handshakes are
+/// still answered so the caller's `perform_handshake` doesn't hang.
+#[derive(Debug, Default)]
+pub struct HandshakeLimiter {
+    last_by_peer: HashMap<EndpointId, Instant>,
+    recent: VecDeque<Instant>,
+}
+
+impl HandshakeLimiter {
+    pub fn allow(&mut self, peer: EndpointId, now: Instant) -> bool {
+        // Prune so memory stays bounded however many identities connect.
+        self.last_by_peer
+            .retain(|_, last| now.duration_since(*last) < HANDSHAKE_PEER_INTERVAL);
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= HANDSHAKE_GLOBAL_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+
+        if self.last_by_peer.contains_key(&peer) || self.recent.len() >= HANDSHAKE_GLOBAL_LIMIT {
+            return false;
+        }
+        self.last_by_peer.insert(peer, now);
+        self.recent.push_back(now);
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SignalingProtocolHandler {
     app_handle: AppHandle,
     local_node_id: String,
+    handshake_limiter: Arc<Mutex<HandshakeLimiter>>,
 }
 
 fn normalized_name(name: &str) -> String {
@@ -72,9 +109,11 @@ async fn local_handshake(app: &AppHandle, node_id: String) -> Result<HandshakePa
     })
 }
 
+// TODO(product): any peer that knows our node ID is auto-added as a contact.
+// Should an unknown peer's handshake require user approval instead?
 async fn save_incoming_contact(app: &AppHandle, remote_id: &str, handshake: &HandshakePayload) {
     // The connection authenticates the peer ID; never trust the self-declared payload ID.
-    let photo_path = save_received_avatar(app, handshake.photo.as_ref()).await;
+    let photo_path = save_received_avatar(app, remote_id, handshake.photo.as_ref()).await;
     let name = normalized_name(&handshake.name);
 
     match db::upsert_contact(app, remote_id, &name, photo_path.as_deref()).await {
@@ -116,8 +155,10 @@ impl ProtocolHandler for SignalingProtocolHandler {
     ) -> std::result::Result<(), AcceptError> {
         let app = self.app_handle.clone();
         let local_node_id = self.local_node_id.clone();
+        let limiter = self.handshake_limiter.clone();
         tokio::spawn(async move {
-            let remote_id = connection.remote_id().to_string();
+            let remote_endpoint = connection.remote_id();
+            let remote_id = remote_endpoint.to_string();
             log::info!("Accepted Iroh connection from {remote_id}");
 
             loop {
@@ -128,6 +169,7 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                 let app_inner = app.clone();
                                 let peer = remote_id.clone();
                                 let local_id = local_node_id.clone();
+                                let limiter = limiter.clone();
                                 tokio::spawn(async move {
                                     let bytes = match recv.read_to_end(MAX_HANDSHAKE_BYTES).await {
                                         Ok(bytes) => bytes,
@@ -142,7 +184,15 @@ impl ProtocolHandler for SignalingProtocolHandler {
                                         && handshake.msg_type == "handshake"
                                     {
                                         log::info!("Received handshake from peer {}: {}", peer, handshake.name);
-                                        save_incoming_contact(&app_inner, &peer, &handshake).await;
+                                        let allowed = limiter
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .allow(remote_endpoint, Instant::now());
+                                        if allowed {
+                                            save_incoming_contact(&app_inner, &peer, &handshake).await;
+                                        } else {
+                                            log::warn!("Rate-limited handshake from {peer}; replying without saving");
+                                        }
 
                                         match local_handshake(&app_inner, local_id).await {
                                             Ok(reply) => match serde_json::to_vec(&reply) {
@@ -271,6 +321,7 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
             SignalingProtocolHandler {
                 app_handle,
                 local_node_id,
+                handshake_limiter: Arc::new(Mutex::new(HandshakeLimiter::default())),
             },
         )
         .spawn();
@@ -403,7 +454,8 @@ pub async fn perform_handshake(
         return Err("Peer returned an invalid handshake response".to_string());
     }
 
-    let remote_photo_path = save_received_avatar(&app, response.photo.as_ref()).await;
+    let remote_photo_path =
+        save_received_avatar(&app, &endpoint_id.to_string(), response.photo.as_ref()).await;
     Ok(HandshakeResult {
         remote_node_id: remote_id,
         remote_name: Some(normalized_name(&response.name)),
@@ -436,6 +488,34 @@ mod tests {
             });
             Ok(())
         }
+    }
+
+    #[test]
+    fn handshake_limiter_enforces_per_peer_interval() {
+        let mut limiter = HandshakeLimiter::default();
+        let peer = SecretKey::generate().public();
+        let start = Instant::now();
+
+        let accepted = (0..100)
+            .filter(|i| limiter.allow(peer, start + Duration::from_millis(*i)))
+            .count();
+        assert_eq!(accepted, 1);
+        assert!(limiter.allow(peer, start + HANDSHAKE_PEER_INTERVAL));
+    }
+
+    #[test]
+    fn handshake_limiter_enforces_global_cap() {
+        let mut limiter = HandshakeLimiter::default();
+        let start = Instant::now();
+
+        let accepted = (0..100)
+            .filter(|_| limiter.allow(SecretKey::generate().public(), start))
+            .count();
+        assert_eq!(accepted, HANDSHAKE_GLOBAL_LIMIT);
+        assert!(limiter.allow(
+            SecretKey::generate().public(),
+            start + HANDSHAKE_GLOBAL_WINDOW
+        ));
     }
 
     #[test]

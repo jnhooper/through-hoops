@@ -164,7 +164,8 @@ export async function removeContact(irohNodeId: string): Promise<void> {
     return;
   }
 
-  await db.execute('DELETE FROM contacts WHERE iroh_node_id = $1', [irohNodeId]);
+  // Rust deletes the row and the contact's avatar file together.
+  await invoke('remove_contact', { nodeId: irohNodeId });
 }
 
 // ================= Local Profile API =================

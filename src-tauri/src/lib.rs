@@ -58,11 +58,16 @@ pub fn run() {
         // Setup persistent Iroh node and store in managed state
         .setup(|app| {
             let app_handle = app.handle().clone();
+            let cleanup_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
                 let signaling_state = signaling::init_node(app_handle)
                     .await
                     .expect("failed to initialize persistent Iroh signaling node");
                 app.manage(signaling_state);
+            });
+            // Best-effort; skips itself if the contacts table can't be read yet.
+            tauri::async_runtime::spawn(async move {
+                db::cleanup_orphan_avatars(&cleanup_handle).await;
             });
             Ok(())
         })
@@ -72,6 +77,7 @@ pub fn run() {
             signaling::perform_handshake,
             db::get_local_profile,
             db::save_local_profile,
+            db::remove_contact,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

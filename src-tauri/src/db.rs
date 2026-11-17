@@ -1,4 +1,7 @@
+use crate::avatar as avatars;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::str::FromStr;
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -95,4 +98,94 @@ pub async fn save_local_profile(
     upsert_local_profile(&app, &name, photo_path.as_deref())
         .await
         .map_err(|e| format!("Failed to save local profile: {e}"))
+}
+
+/// Canonical node ID for filenames: the parsed EndpointId's string form when the
+/// stored ID parses (rows added by hand may differ in case), else the raw ID.
+fn canonical_node_id(node_id: &str) -> String {
+    iroh::EndpointId::from_str(node_id.trim())
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| node_id.trim().to_string())
+}
+
+/// Deletes the contact row and its avatar file(s).
+#[tauri::command]
+pub async fn remove_contact(node_id: String, app: AppHandle) -> Result<(), String> {
+    use sqlx::Row;
+
+    let pool = get_sqlite_pool(&app)
+        .await
+        .map_err(|e| format!("Failed to open database: {e}"))?;
+    let stored_photo: Option<String> =
+        sqlx::query("SELECT photo_path FROM contacts WHERE iroh_node_id = $1")
+            .bind(&node_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("Failed to look up contact: {e}"))?
+            .and_then(|row| row.get("photo_path"));
+    sqlx::query("DELETE FROM contacts WHERE iroh_node_id = $1")
+        .bind(&node_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to remove contact: {e}"))?;
+
+    let dir = avatars::avatars_dir(&app)?;
+    avatars::remove_contact_avatar_files(&dir, &canonical_node_id(&node_id), None).await;
+    // Avatars saved before filenames were derived from the node ID used random
+    // names; delete the stored one if it is a contact avatar in our directory.
+    if let Some(stored) = stored_photo.map(PathBuf::from)
+        && stored.parent() == Some(dir.as_path())
+        && stored
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("contact-"))
+        && let Err(err) = tokio::fs::remove_file(&stored).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!("Unable to remove avatar {}: {err}", stored.display());
+    }
+    Ok(())
+}
+
+/// Best-effort startup sweep: deletes `avatars/contact-*` files that no contact
+/// row references. Skips entirely if the contacts table can't be read, so a
+/// missing or locked database never causes avatars to be deleted.
+pub async fn cleanup_orphan_avatars(app: &AppHandle) {
+    use sqlx::Row;
+
+    let referenced = async {
+        let pool = get_sqlite_pool(app).await?;
+        let rows = sqlx::query("SELECT photo_path FROM contacts WHERE photo_path IS NOT NULL")
+            .fetch_all(&pool)
+            .await?;
+        anyhow::Ok(
+            rows.iter()
+                .filter_map(|row| row.get::<Option<String>, _>("photo_path"))
+                .filter_map(|p| {
+                    PathBuf::from(p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+                .collect::<HashSet<String>>(),
+        )
+    }
+    .await;
+    let referenced = match referenced {
+        Ok(set) => set,
+        Err(err) => {
+            log::info!("Skipping orphan avatar cleanup: {err}");
+            return;
+        }
+    };
+
+    let dir = match avatars::avatars_dir(app) {
+        Ok(dir) => dir,
+        Err(err) => {
+            log::warn!("Skipping orphan avatar cleanup: {err}");
+            return;
+        }
+    };
+    match avatars::remove_orphan_contact_avatars(&dir, &referenced).await {
+        Ok(count) => log::info!("Removed {count} orphan contact avatar file(s)"),
+        Err(err) => log::warn!("Orphan avatar cleanup failed: {err}"),
+    }
 }
