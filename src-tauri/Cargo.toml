@@ -1,8 +1,8 @@
 [package]
 name = "app"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Peer-to-peer video calls over iroh signaling and WebRTC"
+authors = ["John Hooper"]
 license = ""
 repository = ""
 edition = "2024"

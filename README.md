@@ -1,32 +1,87 @@
-# React + TypeScript + Vite
+# through-hoops
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Peer-to-peer video calls with no server in the middle that we operate. Built
+with [Tauri v2](https://v2.tauri.app/), a React 19 + TypeScript frontend, and a
+Rust backend.
 
-Currently, two official plugins are available:
+- **Signaling** (ring, offer, answer, ICE candidates, hangup) travels over
+  [iroh](https://www.iroh.computer/) QUIC connections, in `src-tauri/src/signaling.rs`
+  and `src/services/signaling.ts`.
+- **Media** travels over WebRTC inside the webview (`src/views/ActiveCall.tsx`),
+  using public STUN servers to find a direct path.
+- **Contacts and your profile** live in a local SQLite database. Contacts are
+  added by pasting a peer's node ID; the two sides exchange name and avatar.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+There is deliberately no TURN or hosted relay for media. Calls between networks
+behind strict (symmetric or carrier-grade) NATs may therefore fail to connect.
 
-## React Compiler
+## Prerequisites
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- Node.js and [pnpm](https://pnpm.io/)
+- Rust (see `rust-version` in `src-tauri/Cargo.toml`)
+- The [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/)
+  for your OS
+- For Android: Android Studio with the SDK and NDK, `ANDROID_HOME` set, and the
+  Rust Android targets (`rustup target add aarch64-linux-android` and friends)
 
-## Expanding the Oxlint configuration
+## Run on desktop
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```sh
+pnpm install
+pnpm tauri dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+macOS may ask for camera, microphone and local network access (the usage
+descriptions are in `src-tauri/Info.plist`). Allow them.
+
+## Run on Android
+
+Debug APK, which bundles the frontend and needs no dev server (this is what the
+device testing in `docs/hardening.md` used):
+
+```sh
+pnpm tauri android build --apk --debug
+# adb is in <Android SDK>/platform-tools
+adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+pnpm android:logs   # filter for [DEBUG-ice] and [WebRTC]
+```
+
+Live-reload development works with `pnpm tauri android dev`, with caveats:
+
+- **Camera and microphone need a secure context.** If the page isn't one,
+  `navigator.mediaDevices` is undefined and calls start without local media.
+  Tauri's dev proxy serves the app from `http://tauri.localhost`, but this
+  hasn't been verified for camera access on a physical device. If the camera
+  doesn't work in dev mode, use the debug APK above.
+- **Port 5173 is shared.** `vite.config.ts` uses `strictPort`, so
+  `tauri android dev` and a desktop `tauri dev` can't run at the same time.
+- **Android 17 and later** blocks LAN traffic for apps targeting SDK 37 until the
+  user grants the local network permission. The app asks at launch. Without it,
+  calls on the same Wi-Fi never connect (calls over cellular still can).
+
+Release builds are signed with `src-tauri/gen/android/keystore.properties`
+(`keyAlias`, `password`, `storeFile`; the file is git-ignored). A release build
+without it fails on purpose instead of producing an unsigned APK.
+
+## Checks
+
+```sh
+pnpm build                                        # tsc -b && vite build
+pnpm lint
+pnpm test                                         # vitest
+cd src-tauri && cargo test && cargo clippy --all-targets
+```
+
+## Layout
+
+| Path | What |
+| --- | --- |
+| `src/` | React app: `views/` (Home, ActiveCall), `components/`, `services/` (signaling, db, avatar) |
+| `src-tauri/src/signaling.rs` | iroh node, signaling protocol, handshakes, rate limiting |
+| `src-tauri/src/db.rs` | the single SQLite pool and profile/contact commands |
+| `src-tauri/src/avatar.rs` | avatar validation and storage |
+| `src-tauri/gen/android/` | generated Android project (committed; edit in place) |
+| `docs/hardening.md` | the security and robustness plan, with findings |
+
+The signaling protocol identifier (`SIGNALING_ALPN`) is part of the wire
+format. Don't change it, or installs on different builds can't call each other.
