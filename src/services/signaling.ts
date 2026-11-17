@@ -30,6 +30,12 @@ export function clearBufferedCandidates(sender: string): void {
   bufferedCandidates.delete(sender.trim().toLowerCase());
 }
 
+/** True when the signal's (authenticated) sender is `peerId`, ignoring case. */
+export function isFromPeer(signal: SignalMessage, peerId: string | null | undefined): boolean {
+  if (!signal.sender || !peerId) return false;
+  return signal.sender.trim().toLowerCase() === peerId.trim().toLowerCase();
+}
+
 /**
  * Fetches the local Iroh node's public key / Node ID from the Rust backend.
  */

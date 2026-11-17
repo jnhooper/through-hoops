@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Contact } from './types/contact';
 import type { SignalMessage } from './types/signaling';
 import { Home } from './views/Home';
@@ -7,6 +7,7 @@ import {
   bufferCandidate,
   clearBufferedCandidates,
   getMyNodeId,
+  isFromPeer,
   listenForIncomingSignals,
   sendSignal,
 } from './services/signaling';
@@ -27,6 +28,12 @@ export default function App() {
   const [isIncomingCall, setIsIncomingCall] = useState<boolean>(false);
   const [initialSignal, setInitialSignal] = useState<SignalMessage | null>(null);
   const [incomingCall, setIncomingCall] = useState<IncomingCallInfo | null>(null);
+  // The signal listener below is not re-registered when incomingCall changes,
+  // so it reads the pending call through this ref.
+  const incomingCallRef = useRef<IncomingCallInfo | null>(null);
+  useEffect(() => {
+    incomingCallRef.current = incomingCall;
+  }, [incomingCall]);
 
   // Global listener for incoming calls when user is in home view
   useEffect(() => {
@@ -60,6 +67,22 @@ export default function App() {
           // If already in an active call, ActiveCall handles signals directly
           if (currentView === 'active-call') return;
 
+          // One pending call at a time. A different caller is told we're busy
+          // instead of replacing the call the user is looking at.
+          const pending = incomingCallRef.current;
+          if (pending && !isFromPeer(signal, pending.nodeId)) {
+            console.info(`Ignoring ${signal.type} from ${sender}: another call is pending`);
+            clearBufferedCandidates(sender);
+            void getMyNodeId()
+              .then((me) =>
+                sendSignal(sender, JSON.stringify({ type: 'hangup', reason: 'busy', sender: me }))
+              )
+              .catch(() => {
+                // Best effort; the caller times out on its own otherwise.
+              });
+            return;
+          }
+
           // A ring starts a fresh call; discard leftovers from an earlier one.
           if (signal.type === 'ring') clearBufferedCandidates(sender);
 
@@ -75,16 +98,15 @@ export default function App() {
             console.warn('Could not load contacts to resolve caller name', e);
           }
 
-          setIncomingCall((current) => ({
-            nodeId: sender,
-            name: callerName,
-            offerSignal:
-              signal.type === 'offer'
-                ? signal
-                : current?.nodeId.toLowerCase() === sender.toLowerCase()
-                  ? current.offerSignal
-                  : null,
-          }));
+          setIncomingCall((current) => {
+            // Re-check after the await above: another caller may have won.
+            if (current && !isFromPeer(signal, current.nodeId)) return current;
+            return {
+              nodeId: sender,
+              name: callerName,
+              offerSignal: signal.type === 'offer' ? signal : (current?.offerSignal ?? null),
+            };
+          });
         }
       } catch (e) {
         console.warn('Failed to handle incoming signal in App:', e);

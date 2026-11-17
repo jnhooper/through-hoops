@@ -21,6 +21,7 @@ import {
   listenForIncomingSignals,
   takeBufferedCandidates,
   clearBufferedCandidates,
+  isFromPeer,
 } from '../services/signaling';
 
 interface ActiveCallProps {
@@ -87,7 +88,9 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
   >('initializing');
   const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
-  const [remoteNodeId, setRemoteNodeId] = useState<string>(
+  // The peer is fixed for the call: App always passes `contact`, including for
+  // incoming calls, so there is no "adopt the first sender" fallback.
+  const [remoteNodeId] = useState<string>(
     contact?.iroh_node_id || initialSignal?.sender || ''
   );
 
@@ -223,13 +226,7 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
     let unlisten: (() => void) | undefined;
 
     listenForIncomingSignals((signal) => {
-      const currentPeer = remoteNodeIdRef.current;
-      if (
-        signal.type === 'hangup' &&
-        signal.sender &&
-        currentPeer &&
-        signal.sender.toLowerCase() === currentPeer.toLowerCase()
-      ) {
+      if (signal.type === 'hangup' && isFromPeer(signal, remoteNodeIdRef.current)) {
         cleanupCall();
       }
     })
@@ -458,11 +455,6 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
           if (isCallEndedRef.current || !pcRef.current) return;
           const currentPc = pcRef.current;
 
-          if (signal.sender && !remoteNodeIdRef.current) {
-            remoteNodeIdRef.current = signal.sender;
-            setRemoteNodeId(signal.sender);
-          }
-
           try {
             if (signal.type === 'offer' && signal.sdp) {
               console.info('[WebRTC] Handling incoming SDP Offer');
@@ -510,6 +502,12 @@ export const ActiveCall: React.FC<ActiveCallProps> = ({
         // 7. Subscribe to Tauri incoming_signal events
         unlistenSignals = await listenForIncomingSignals((signal) => {
           if (signal.type === 'hangup') return;
+          if (!isFromPeer(signal, remoteNodeIdRef.current)) {
+            console.warn(
+              `[WebRTC] Dropping ${signal.type} from ${signal.sender ?? 'unknown'}: not the current peer`
+            );
+            return;
+          }
           void handleSignalMessage(signal);
         });
         if (isStaleInitialization()) {
