@@ -170,23 +170,11 @@ export async function removeContact(irohNodeId: string): Promise<void> {
 
 // ================= Local Profile API =================
 
+// Under Tauri the Rust commands are the only source of truth (they are what
+// peers see), so their errors propagate. localStorage is browser-preview only.
 export async function getLocalProfile(): Promise<LocalProfile> {
   if (isTauriEnvironment()) {
-    try {
-      return await invoke<LocalProfile>('get_local_profile');
-    } catch (e) {
-      console.warn('invoke get_local_profile failed, falling back to db query', e);
-    }
-
-    const db = await getDb();
-    if (db) {
-      const rows = await db.select<LocalProfile[]>(
-        'SELECT name, photo_path FROM local_profile WHERE id = 1'
-      );
-      if (rows && rows.length > 0) {
-        return rows[0];
-      }
-    }
+    return await invoke<LocalProfile>('get_local_profile');
   }
 
   try {
@@ -207,22 +195,10 @@ export async function saveLocalProfile(
   const cleanPhotoPath = photoPath || null;
 
   if (isTauriEnvironment()) {
-    try {
-      return await invoke<LocalProfile>('save_local_profile', {
-        name: trimmedName,
-        photoPath: cleanPhotoPath,
-      });
-    } catch (e) {
-      console.warn('invoke save_local_profile failed, falling back to db execute', e);
-    }
-
-    const db = await getDb();
-    if (db) {
-      await db.execute(
-        'INSERT OR REPLACE INTO local_profile (id, name, photo_path) VALUES (1, $1, $2)',
-        [trimmedName, cleanPhotoPath]
-      );
-    }
+    return await invoke<LocalProfile>('save_local_profile', {
+      name: trimmedName,
+      photoPath: cleanPhotoPath,
+    });
   }
 
   const profile: LocalProfile = { name: trimmedName, photo_path: cleanPhotoPath };

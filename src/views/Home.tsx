@@ -115,6 +115,7 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
       })
       .catch((err: unknown) => {
         console.error('Failed to load local profile:', err);
+        if (!ignore) setStatusMessage(`Unable to load your profile: ${String(err)}`);
       });
     return () => {
       ignore = true;
