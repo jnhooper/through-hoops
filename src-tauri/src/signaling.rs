@@ -259,6 +259,31 @@ pub struct SignalingState {
     pub _router: Router,
 }
 
+/// Managed state for the signaling node. It always exists, so commands never
+/// hit an unmanaged-state panic: if the node failed to start, the app still
+/// runs and signaling commands return the startup error.
+pub struct Networking(std::result::Result<SignalingState, String>);
+
+impl Networking {
+    pub fn ready(state: SignalingState) -> Self {
+        Self(Ok(state))
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self(Err(reason.into()))
+    }
+
+    pub fn get(&self) -> std::result::Result<&SignalingState, String> {
+        self.0
+            .as_ref()
+            .map_err(|reason| format!("Networking unavailable: {reason}"))
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.0.as_ref().err().map(String::as_str)
+    }
+}
+
 /// Loads an existing 32-byte secret key from `<app_data_dir>/node_secret.key`,
 /// or generates a new one and saves it so the Node ID remains persistent.
 async fn load_or_create_secret_key(app_handle: &AppHandle) -> Result<SecretKey> {
@@ -309,12 +334,14 @@ async fn load_or_create_secret_key(app_handle: &AppHandle) -> Result<SecretKey> 
 pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
     let secret_key = load_or_create_secret_key(&app_handle).await?;
 
-    let mdns = iroh_mdns_peer_lookup::lookup(MdnsOptions::new().build())
-        .await
-        .context("Failed to initialize mDNS peer lookup")?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .address_lookup(mdns)
-        .secret_key(secret_key)
+    let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+    // Local-network discovery is optional: without it peers are still reachable
+    // through the relay and discovery service, just not by mDNS.
+    match iroh_mdns_peer_lookup::lookup(MdnsOptions::new().build()).await {
+        Ok(mdns) => builder = builder.address_lookup(mdns),
+        Err(err) => log::warn!("mDNS peer lookup unavailable, continuing without it: {err:#}"),
+    }
+    let endpoint = builder
         .bind()
         .await
         .context("Failed to bind Iroh endpoint")?;
@@ -342,9 +369,17 @@ pub async fn init_node(app_handle: AppHandle) -> Result<SignalingState> {
 
 #[tauri::command]
 pub async fn get_my_node_id(
-    state: State<'_, SignalingState>,
+    networking: State<'_, Networking>,
 ) -> std::result::Result<String, String> {
-    Ok(state.endpoint.id().to_string())
+    Ok(networking.get()?.endpoint.id().to_string())
+}
+
+/// Why networking failed to start, or `None` when it is running.
+#[tauri::command]
+pub fn networking_error(networking: State<'_, Networking>) -> Option<String> {
+    networking
+        .error()
+        .map(|reason| format!("Networking unavailable: {reason}"))
 }
 
 async fn get_or_create_connection(
@@ -398,11 +433,12 @@ async fn get_or_create_connection(
 pub async fn send_signal(
     remote_id: String,
     payload: String,
-    state: State<'_, SignalingState>,
+    networking: State<'_, Networking>,
 ) -> std::result::Result<(), String> {
+    let state = networking.get()?;
     let endpoint_id = EndpointId::from_str(&remote_id)
         .map_err(|e| format!("Invalid remote Iroh node ID: {e}"))?;
-    let conn = get_or_create_connection(&state, endpoint_id, &remote_id).await?;
+    let conn = get_or_create_connection(state, endpoint_id, &remote_id).await?;
 
     let (mut send, _recv) = tokio::time::timeout(SIGNAL_TIMEOUT, conn.open_bi())
         .await
@@ -424,8 +460,9 @@ pub async fn send_signal(
 pub async fn perform_handshake(
     remote_id: String,
     app: AppHandle,
-    state: State<'_, SignalingState>,
+    networking: State<'_, Networking>,
 ) -> std::result::Result<HandshakeResult, String> {
+    let state = networking.get()?;
     let endpoint_id = EndpointId::from_str(&remote_id)
         .map_err(|err| format!("Invalid remote Iroh node ID: {err}"))?;
     if endpoint_id == state.endpoint.id() {
@@ -437,7 +474,7 @@ pub async fn perform_handshake(
         .map_err(|err| format!("Failed to serialize handshake payload: {err}"))?;
 
     let exchange = async {
-        let conn = get_or_create_connection(&state, endpoint_id, &remote_id).await?;
+        let conn = get_or_create_connection(state, endpoint_id, &remote_id).await?;
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -502,6 +539,16 @@ mod tests {
             });
             Ok(())
         }
+    }
+
+    #[test]
+    fn unavailable_networking_reports_the_startup_error() {
+        let networking = Networking::unavailable("bind failed");
+        assert_eq!(
+            networking.get().err().as_deref(),
+            Some("Networking unavailable: bind failed")
+        );
+        assert_eq!(networking.error(), Some("bind failed"));
     }
 
     #[test]

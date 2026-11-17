@@ -56,12 +56,17 @@ pub fn run() {
             let pool = tauri::async_runtime::block_on(db::open_pool(&db_path))?;
             app.manage(db::Db(pool.clone()));
 
-            tauri::async_runtime::block_on(async move {
-                let signaling_state = signaling::init_node(app_handle)
-                    .await
-                    .expect("failed to initialize persistent Iroh signaling node");
-                app.manage(signaling_state);
-            });
+            // A failed node start must not crash the app: keep running with
+            // signaling marked unavailable, and let Home show a banner.
+            let networking = match tauri::async_runtime::block_on(signaling::init_node(app_handle))
+            {
+                Ok(state) => signaling::Networking::ready(state),
+                Err(err) => {
+                    log::error!("Failed to start networking: {err:#}");
+                    signaling::Networking::unavailable(format!("{err:#}"))
+                }
+            };
+            app.manage(networking);
             // Best-effort; runs after the schema above exists.
             tauri::async_runtime::spawn(async move {
                 db::cleanup_orphan_avatars(&cleanup_handle, &pool).await;
@@ -70,6 +75,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             signaling::get_my_node_id,
+            signaling::networking_error,
             signaling::send_signal,
             signaling::perform_handshake,
             db::get_local_profile,

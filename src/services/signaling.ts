@@ -30,6 +30,15 @@ export function clearBufferedCandidates(sender: string): void {
   bufferedCandidates.delete(sender.trim().toLowerCase());
 }
 
+/**
+ * Returns why the Rust networking layer failed to start, or null when it is
+ * running (always null in browser preview).
+ */
+export async function getNetworkingError(): Promise<string | null> {
+  if (!isTauriEnvironment()) return null;
+  return await invoke<string | null>('networking_error');
+}
+
 /** True when the signal's (authenticated) sender is `peerId`, ignoring case. */
 export function isFromPeer(signal: SignalMessage, peerId: string | null | undefined): boolean {
   if (!signal.sender || !peerId) return false;

@@ -25,6 +25,7 @@ import {
 } from '../services/db';
 import { ContactCard } from '../components/ContactCard';
 import { parseDbTimestamp } from '../utils/time';
+import { getNetworkingError } from '../services/signaling';
 import { AddContactModal } from '../components/AddContactModal';
 import { MyCodeModal } from '../components/MyCodeModal';
 import { ProfileModal } from '../components/ProfileModal';
@@ -45,6 +46,7 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
     photo_path: null,
   });
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [networkingError, setNetworkingError] = useState<string | null>(null);
 
   // Load contacts from SQLite via @tauri-apps/plugin-sql
   const fetchContacts = useCallback(async () => {
@@ -117,6 +119,20 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
       .catch((err: unknown) => {
         console.error('Failed to load local profile:', err);
         if (!ignore) setStatusMessage(`Unable to load your profile: ${String(err)}`);
+      });
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    getNetworkingError()
+      .then((reason) => {
+        if (!ignore) setNetworkingError(reason);
+      })
+      .catch((err: unknown) => {
+        console.error('Failed to check networking status:', err);
       });
     return () => {
       ignore = true;
@@ -270,6 +286,16 @@ export const Home: React.FC<HomeProps> = ({ onStartCall }) => {
             className="w-full rounded-2xl bg-zinc-900/80 border border-zinc-800/80 pl-10 pr-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/80 transition-all shadow-inner"
           />
         </div>
+
+        {networkingError && (
+          <div
+            role="alert"
+            className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm"
+          >
+            {networkingError}. You can browse contacts, but calls and adding contacts won&apos;t
+            work until the app is restarted.
+          </div>
+        )}
 
         {statusMessage && (
           <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm">
