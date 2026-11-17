@@ -31,7 +31,7 @@ android {
         val keystorePropertiesFile = rootProject.file("keystore.properties")
         val keystoreProperties = Properties()
         if (keystorePropertiesFile.exists()) {
-          keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+          FileInputStream(keystorePropertiesFile).use { keystoreProperties.load(it) }
           keyAlias = keystoreProperties["keyAlias"] as String
           keyPassword = keystoreProperties["password"] as String
           storeFile = file(keystoreProperties["storeFile"] as String)
@@ -74,6 +74,29 @@ android {
     }
     buildFeatures {
         buildConfig = true
+    }
+}
+
+// Without keystore.properties the release signing config stays empty and the
+// release build used to come out unsigned without any error. Make that a hard
+// failure. This is a task, not a configuration-time check, so it also runs on
+// configuration-cache hits.
+val requireReleaseSigning by tasks.registering {
+    val keystoreFile = rootProject.file("keystore.properties")
+    doFirst {
+        if (!keystoreFile.exists()) {
+            throw GradleException(
+                "Release builds must be signed, but ${keystoreFile.path} does not exist. " +
+                    "Create it with keyAlias, password and storeFile entries " +
+                    "(see the signingConfigs block in app/build.gradle.kts)."
+            )
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name.matches(Regex("^(assemble|bundle|package).*Release$"))) {
+        dependsOn(requireReleaseSigning)
     }
 }
 
